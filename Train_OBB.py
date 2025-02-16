@@ -19,7 +19,7 @@ need_cropping = True
 need_augmentation = False
 tile_size = 150
 overlap = 50
-epochs = 10
+epochs = 150
 batch_size = 16
 object_boundary_threshold = 0.1  # Minimum fraction of the bounding box that must remain in the crop
 class_balance_threshold = 500  # Minimum number of samples per class for balance
@@ -71,9 +71,11 @@ def crop_images_and_labels(image_dir, label_dir, output_image_dir, output_label_
 
         labels = pd.read_csv(label_path, sep=" ", header=None)
         labels.columns = ["class", "x1", "y1", "x2", "y2", "x3", "y3", "x4", "y4"]
+        
+        # Convert normalized coordinates to absolute values
         labels[["x1", "x2", "x3", "x4"]] *= w
         labels[["y1", "y2", "y3", "y4"]] *= h
-
+        
         step = tile_size - overlap
         tile_id = 0
         for y in range(0, h, step):
@@ -83,34 +85,25 @@ def crop_images_and_labels(image_dir, label_dir, output_image_dir, output_label_
                     continue
 
                 # Find labels within the crop region
-                valid_labels = []
-                for _, row in labels.iterrows():
-                    x1, y1, x2, y2, x3, y3, x4, y4 = row["x1"], row["y1"], row["x2"], row["y2"], row["x3"], row["y3"], row["x4"], row["y4"]
-                    
-                    # Check if at least part of the bounding box is within the crop
-                    if (x1 >= x and x1 < x + tile_size and y1 >= y and y1 < y + tile_size) or \
-                       (x2 >= x and x2 < x + tile_size and y2 >= y and y2 < y + tile_size) or \
-                       (x3 >= x and x3 < x + tile_size and y3 >= y and y3 < y + tile_size) or \
-                       (x4 >= x and x4 < x + tile_size and y4 >= y and y4 < y + tile_size):
-                        
-                        # Adjust coordinates
-                        new_x1, new_y1 = max(0, x1 - x), max(0, y1 - y)
-                        new_x2, new_y2 = max(0, x2 - x), max(0, y2 - y)
-                        new_x3, new_y3 = max(0, x3 - x), max(0, y3 - y)
-                        new_x4, new_y4 = max(0, x4 - x), max(0, y4 - y)
+                tile_labels = labels[
+                    (labels["x1"] >= x) & (labels["x1"] < x + tile_size) &
+                    (labels["y1"] >= y) & (labels["y1"] < y + tile_size)
+                ].copy()
 
-                        valid_labels.append([row["class"], new_x1, new_y1, new_x2, new_y2, new_x3, new_y3, new_x4, new_y4])
+                # Adjust coordinates of labels for the crop
+                tile_labels[["x1", "x2", "x3", "x4"]] -= x
+                tile_labels[["y1", "y2", "y3", "y4"]] -= y
+                
+                tile_labels[["x1", "x2", "x3", "x4"]] = tile_labels[["x1", "x2", "x3", "x4"]].clip(0, tile_size)
+                tile_labels[["y1", "y2", "y3", "y4"]] = tile_labels[["y1", "y2", "y3", "y4"]].clip(0, tile_size)
+
+                # Normalize coordinates with respect to tile size
+                tile_labels[["x1", "x2", "x3", "x4"]] /= tile_size
+                tile_labels[["y1", "y2", "y3", "y4"]] /= tile_size
 
                 # Skip saving this crop if no valid labels remain
-                if not valid_labels:
+                if tile_labels.empty:
                     continue
-
-                valid_labels_df = pd.DataFrame(valid_labels)
-
-                # Normalize the adjusted labels for YOLO format
-                for col in valid_labels_df.columns[1:]:  
-                    valid_labels_df[col] /= tile_size  
-
 
                 # Save cropped image
                 tile_image_filename = f"{os.path.splitext(image_file)[0]}_tile_{tile_id}.jpg"
@@ -120,10 +113,11 @@ def crop_images_and_labels(image_dir, label_dir, output_image_dir, output_label_
                 # Save adjusted labels
                 tile_label_filename = f"{os.path.splitext(image_file)[0]}_tile_{tile_id}.txt"
                 tile_label_path = os.path.join(output_label_dir, tile_label_filename)
-                valid_labels_df.to_csv(tile_label_path, sep=" ", header=False, index=False)
+                tile_labels.to_csv(tile_label_path, sep=" ", header=False, index=False)
 
                 # Store new image path for updating the txt file
                 new_paths.append(tile_image_path)
+
                 tile_id += 1
 
         print(f"Processed image: {image_file}")
