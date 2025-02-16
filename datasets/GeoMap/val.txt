@@ -1,1 +1,3 @@
+datasets/GeoMap/images/val/5313.png
+datasets/GeoMap/images/val/5609.png
 datasets/GeoMap/images/val/5812_St_Goarshausen.png
