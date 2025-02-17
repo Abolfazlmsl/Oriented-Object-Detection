@@ -13,10 +13,10 @@ import numpy as np
 import pandas as pd
 from shapely.geometry import Polygon
 
-tile_sizes = [150]
-overlaps = [50]
-iou_threshold = 0.01
-models = [YOLO("best150.pt")]
+tile_sizes = [150, 400]
+overlaps = [50, 150]
+iou_threshold = 0.2
+models = [YOLO("best150.pt"), YOLO("best400.pt")]
 
 # Define colors for different classes
 CLASS_COLORS = {
@@ -59,12 +59,12 @@ CLASS_THRESHOLDS = {
     2: 0.6,  # Spring 1
     3: 0.6,  # Minepit 1
     4: 0.7,  # Hillside
-    5: 0.05,  # Feuchte
-    6: 0.05,  # Torf
+    5: 0.7,  # Feuchte
+    6: 0.7,  # Torf
     7: 0.05,  # Bergsturz
-    8: 0.05,  # Landslide 2
-    9: 0.05,  # Spring 2
-    10: 0.05,  # Spring 3
+    8: 0.7,  # Landslide 2
+    9: 0.7,  # Spring 2
+    10: 0.7,  # Spring 3
     11: 0.4,  # Minepit 2
     12: 0.05,  # Spring B2
 }
@@ -77,8 +77,8 @@ def compute_angle_from_bbox(points):
     Compute the orientation angle of a bounding box given its four corner points.
     """
     x1, y1, x2, y2, x3, y3, x4, y4 = points
-    angle = np.arctan2(y2 - y1, x2 - x1) * (180.0 / np.pi)
-    return angle
+    angle = np.arctan2(y3 - y1, x3 - x1) * (180.0 / np.pi)
+    return 90 - np.abs(angle)
 
 
 def convert_to_grayscale(image):
@@ -135,7 +135,11 @@ def detect_symbols(image, model, tile_size, overlap):
                 conf = float(box.conf[0])
                 if conf < CLASS_THRESHOLDS.get(cls, 0.05):
                     continue
-                angle = compute_angle_from_bbox(points)
+                
+                if CLASS_NAMES.get(cls, f"Class{cls}") == "Strike": 
+                    angle = compute_angle_from_bbox(points)
+                else:
+                    angle = 0
                 detections.append((x1 + x, y1 + y, x2 + x, y2 + y, x3 + x, y3 + y,\
                                    x4 + x, y4 + y, cls, conf, angle))
     return detections
