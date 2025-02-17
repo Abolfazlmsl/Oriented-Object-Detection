@@ -154,40 +154,28 @@ def merge_detections(detections, iou_threshold=0.5):
     if not detections:
         return []
     
-    detections.sort(key=lambda x: x[-1], reverse=True)  # Sort by confidence (higher first)
+    detections.sort(key=lambda x: x[9], reverse=True)  # Sort by confidence (higher first)
     merged = []
-
+    
     for i, det1 in enumerate(detections):
-        box1 = det1[:8]  # Extract the 4 points
-        cls1, conf1 = det1[8], det1[9]
+        box1, cls1, conf1 = det1[:8], det1[8], det1[9]
+        if cls1 in EXCLUDED_CLASSES:
+            continue  # Skip excluded classes
+        
         poly1 = Polygon([(box1[i], box1[i+1]) for i in range(0, 8, 2)])
-        area1 = poly1.area
         keep = True
 
-        for j, det2 in enumerate(detections):
-            if i == j:
-                continue
-            
-            box2 = det2[:8]
-            cls2, conf2 = det2[8], det2[9]
+        for j, det2 in enumerate(merged):
+            box2, cls2 = det2[:8], det2[8]
             poly2 = Polygon([(box2[i], box2[i+1]) for i in range(0, 8, 2)])
-            area2 = poly2.area
-            iou = compute_polygon_iou(box1, box2)
-
-            if iou >= iou_threshold and cls1 == cls2:
-                intersection_area = poly1.intersection(poly2).area
-                non_overlap_area = area1 - intersection_area
-
-                if conf1 < conf2:
-                    if (non_overlap_area / area1) >= 0.4:
-                        keep = True
-                    else:
-                        keep = False
-                        break
+            
+            if cls1 == cls2 and compute_polygon_iou(box1, box2) >= iou_threshold:
+                keep = False  # Remove duplicate or highly overlapping boxes
+                break
 
         if keep:
             merged.append(det1)
-
+    
     return merged
 
 
@@ -206,13 +194,24 @@ def process_image(image_path, output_dir):
     excel_path = os.path.join(output_dir, image_name.replace(".jpg", ".xlsx").replace(".png", ".xlsx"))
     
     data = []
-    for x1, y1, x2, y2, x3, y3, x4, y4, cls, conf, angle in all_detections:
+    for x1, y1, x2, y2, x3, y3, x4, y4, cls, conf, angle in merged_detections:
+        if cls in EXCLUDED_CLASSES:
+            continue  # Ignore excluded classes
+        
         color = CLASS_COLORS.get(cls, (0, 255, 255))
         label = CLASS_NAMES.get(cls, f"Class{cls}")
-        cv2.polylines(result_image, [np.array([[x1, y1], [x2, y2], [x3, y3], [x4, y4]], np.int32)], isClosed=True, color=color, thickness=2)
-        cv2.putText(result_image, f"{label} {conf:.2f}", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+        
+        # Draw polygon
+        points = np.array([[x1, y1], [x2, y2], [x3, y3], [x4, y4]], np.int32)
+        cv2.polylines(result_image, [points], isClosed=True, color=color, thickness=2)
+        
+        # Place label text above the topmost y-coordinate of the box
+        text_x = min(x1, x2, x3, x4)
+        text_y = min(y1, y2, y3, y4) - 10  # Shift text above the box
+        cv2.putText(result_image, f"{label} {conf:.2f}", (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+        
         data.append([label, x1, y1, x2, y2, x3, y3, x4, y4, conf, angle])
-
+    
     output_path = os.path.join(output_dir, os.path.basename(image_path).replace(".jpg", "_detected.jpg").replace(".png", "_detected.png"))
     cv2.imwrite(output_path, result_image)
     
