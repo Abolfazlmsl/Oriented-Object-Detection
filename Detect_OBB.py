@@ -77,8 +77,8 @@ def compute_angle_from_bbox(points):
     Compute the orientation angle of a bounding box given its four corner points.
     """
     x1, y1, x2, y2, x3, y3, x4, y4 = points
-    angle = np.arctan2(y3 - y1, x3 - x1) * (180.0 / np.pi)
-    return 90 - np.abs(angle)
+    angle = np.abs(np.arctan2(x3 - x1, y3 - y1) * (180.0 / np.pi))
+    return angle
 
 
 def convert_to_grayscale(image):

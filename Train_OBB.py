@@ -15,12 +15,12 @@ import torch
 from ultralytics import YOLO
 
 # Configuration
-need_cropping = True
+need_cropping = False
 need_augmentation = False
-tile_size = 150
-overlap = 50
+tile_size = 400
+overlap = 150
 epochs = 150
-batch_size = 16
+batch_size = 8
 object_boundary_threshold = 0.1  # Minimum fraction of the bounding box that must remain in the crop
 class_balance_threshold = 500  # Minimum number of samples per class for balance
 augmentation_repeats = 10  # Number of times to augment underrepresented classes
@@ -265,18 +265,35 @@ if __name__ == "__main__":
         )
 
     model = YOLO("yolo11x-obb.pt")
-
+    
+    # Size 400
     model.train(
         data="datasets/GeoMap/data.yaml",
         epochs=epochs,
         imgsz=tile_size,  # Image size (same as crop size)
         batch=batch_size,
         multi_scale=True,
-        lr0 = 0.005,  
+        lr0 = 0.001,  
         lrf = 0.05,      
-        weight_decay = 0.001, 
-        dropout = 0.2,
+        weight_decay = 0.005, 
+        dropout = 0.5,
         plots = True,
         overlap_mask = False,
         device=[0, 1] if torch.cuda.is_available() else "CPU",
     )
+    
+    # # Size 150
+    # model.train(
+    #     data="datasets/GeoMap/data.yaml",
+    #     epochs=epochs,
+    #     imgsz=tile_size,  # Image size (same as crop size)
+    #     batch=batch_size,
+    #     multi_scale=True,
+    #     lr0 = 0.005,  
+    #     lrf = 0.05,      
+    #     weight_decay = 0.001, 
+    #     dropout = 0.2,
+    #     plots = True,
+    #     overlap_mask = False,
+    #     device=[0, 1] if torch.cuda.is_available() else "CPU",
+    # )
