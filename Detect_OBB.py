@@ -14,7 +14,7 @@ import pandas as pd
 from shapely.geometry import Polygon
 
 tile_sizes = [150, 400]
-overlaps = [50, 150]
+overlaps = [100, 250]
 iou_threshold = 0.2
 models = [YOLO("best150.pt"), YOLO("best400.pt")]
 
@@ -32,7 +32,8 @@ CLASS_COLORS = {
     9: (60, 50, 20), # Spring 2  
     10: (200, 150, 80), # Spring 3  
     11: (100, 200, 150), # Minepit 2 
-    12: (12, 52, 83), # Spring B2 
+    12: (12, 52, 83), # Spring B2
+    13: (123, 232, 23), # Spring B2 
 }
 
 # Define class names
@@ -50,6 +51,7 @@ CLASS_NAMES = {
     10: "Spring 3",
     11: "Minepit 2",
     12: "Spring B2",
+    13: "Hillside B2",
 }
 
 # Add threshold for each class
@@ -67,6 +69,7 @@ CLASS_THRESHOLDS = {
     10: 0.7,  # Spring 3
     11: 0.4,  # Minepit 2
     12: 0.05,  # Spring B2
+    13: 0.05,  # Hillside B2
 }
 
 # Classes to exclude completely (will not be shown on the image)
@@ -77,7 +80,13 @@ def compute_angle_from_bbox(points):
     Compute the orientation angle of a bounding box given its four corner points.
     """
     x1, y1, x2, y2, x3, y3, x4, y4 = points
-    angle = np.abs(np.arctan2(x3 - x1, y3 - y1) * (180.0 / np.pi))
+    angle = np.arctan2(x4 - x1, y4 - y1) * (180.0 / np.pi)
+    
+    if angle > 0:
+        angle = 180 - angle
+    else:
+        angle = np.abs(angle)
+        
     return angle
 
 
