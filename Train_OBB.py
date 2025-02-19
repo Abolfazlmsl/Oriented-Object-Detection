@@ -15,8 +15,8 @@ import torch
 from ultralytics import YOLO
 
 # Configuration
-need_cropping = True
-need_augmentation = True
+need_cropping = False 
+need_augmentation = False
 tile_size = 150
 overlap = 50
 epochs = 150

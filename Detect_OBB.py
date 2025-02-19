@@ -13,10 +13,10 @@ import numpy as np
 import pandas as pd
 from shapely.geometry import Polygon
 
-tile_sizes = [150, 400]
-overlaps = [100, 250]
+tile_sizes = [150]
+overlaps = [100]
 iou_threshold = 0.2
-models = [YOLO("best150.pt"), YOLO("best400.pt")]
+models = [YOLO("best150.pt")]
 
 # Define colors for different classes
 CLASS_COLORS = {
@@ -62,18 +62,18 @@ CLASS_THRESHOLDS = {
     3: 0.6,  # Minepit 1
     4: 0.7,  # Hillside
     5: 0.7,  # Feuchte
-    6: 0.7,  # Torf
+    6: 0.6,  # Torf
     7: 0.05,  # Bergsturz
     8: 0.7,  # Landslide 2
     9: 0.7,  # Spring 2
     10: 0.7,  # Spring 3
-    11: 0.4,  # Minepit 2
+    11: 0.6,  # Minepit 2
     12: 0.05,  # Spring B2
     13: 0.05,  # Hillside B2
 }
 
 # Classes to exclude completely (will not be shown on the image)
-EXCLUDED_CLASSES = {12}  
+EXCLUDED_CLASSES = {12, 13}  
 
 def compute_angle_from_bbox(points):
     """
@@ -90,7 +90,7 @@ def compute_angle_from_bbox(points):
     return angle
 
 
-def convert_to_grayscale(image):
+def convert_bgr_to_rgb(image):
     """
     Convert an image to grayscale and return a 3-channel grayscale image.
 
@@ -101,7 +101,9 @@ def convert_to_grayscale(image):
     np.ndarray: 3-channel grayscale image.
     """
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    return cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
+    gray = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
+    # gray = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    return gray
 
 def compute_polygon_iou(box1, box2):
     """
@@ -135,8 +137,8 @@ def detect_symbols(image, model, tile_size, overlap):
             crop = image[y:y + tile_size, x:x + tile_size]
             if crop.shape[0] != tile_size or crop.shape[1] != tile_size:
                 continue
-            crop_gray = convert_to_grayscale(crop)
-            results = model(crop_gray)
+            # crop_gray = convert_bgr_to_rgb(crop)
+            results = model(crop)
             for box in results[0].obb:
                 points = [int(x) for x in box.xyxyxyxy[0].flatten().tolist()]
                 x1, y1, x2, y2, x3, y3, x4, y4 = points
