@@ -56,14 +56,14 @@ CLASS_NAMES = {
 
 # Add threshold for each class
 CLASS_THRESHOLDS = {
-    0: 0.8,  # Landslide 1
+    0: 0.7,  # Landslide 1
     1: 0.8,  # Strike
     2: 0.8,  # Spring 1
     3: 0.8,  # Minepit 1
     4: 0.8,  # Hillside
     5: 0.7,  # Feuchte
-    6: 0.8,  # Torf
-    7: 0.05,  # Bergsturz
+    6: 0.7,  # Torf
+    7: 0.45,  # Bergsturz
     8: 0.7,  # Landslide 2
     9: 0.7,  # Spring 2
     10: 0.7,  # Spring 3
@@ -179,16 +179,16 @@ def merge_detections(detections, iou_threshold=0.5):
         if cls1 in EXCLUDED_CLASSES:
             continue 
         
-        poly1 = Polygon([(box1[i], box1[i+1]) for i in range(0, 8, 2)])
+        # poly1 = Polygon([(box1[i], box1[i+1]) for i in range(0, 8, 2)])
         keep = True
 
         for det_excl in excluded_boxes:
            excl_box, excl_cls, excl_conf = det_excl[:8], det_excl[8], det_excl[9]
-           poly_excl = Polygon([(excl_box[i], excl_box[i+1]) for i in range(0, 8, 2)])
+           # poly_excl = Polygon([(excl_box[i], excl_box[i+1]) for i in range(0, 8, 2)])
            iou = compute_polygon_iou(box1, excl_box)
            
            if iou > 0.3:
-               if conf1 > 0.5 and excl_conf < 0.5:
+               if conf1 > 0.85 or excl_conf < 0.5:
                    continue  
                else:
                    keep = False  
@@ -196,7 +196,7 @@ def merge_detections(detections, iou_threshold=0.5):
         
         for det2 in merged:
             box2, cls2 = det2[:8], det2[8]
-            poly2 = Polygon([(box2[i], box2[i+1]) for i in range(0, 8, 2)])
+            # poly2 = Polygon([(box2[i], box2[i+1]) for i in range(0, 8, 2)])
             
             if cls1 == cls2 and compute_polygon_iou(box1, box2) >= iou_threshold:
                 keep = False  
