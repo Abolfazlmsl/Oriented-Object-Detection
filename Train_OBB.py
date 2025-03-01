@@ -9,7 +9,6 @@ Created on Tue Feb  4 13:52:07 2025
 import os
 import cv2
 import pandas as pd
-import numpy as np
 import random
 import torch
 from ultralytics import YOLO
@@ -17,9 +16,9 @@ from ultralytics import YOLO
 # Configuration
 need_cropping = False 
 need_augmentation = False
-tile_size = 150
-overlap = 50
-epochs = 150
+tile_size = 400
+overlap = 150
+epochs = 300
 batch_size = 16
 object_boundary_threshold = 0.1  # Minimum fraction of the bounding box that must remain in the crop
 class_balance_threshold = 500  # Minimum number of samples per class for balance
@@ -86,8 +85,8 @@ def crop_images_and_labels(image_dir, label_dir, output_image_dir, output_label_
 
                 # Find labels within the crop region
                 tile_labels = labels[
-                    (labels["x1"] >= x) & (labels["x1"] < x + tile_size) &
-                    (labels["y1"] >= y) & (labels["y1"] < y + tile_size)
+                    ((labels["x1"] + labels["x4"])/2 >= x) & ((labels["x1"] + labels["x4"])/2 < x + tile_size) &
+                    ((labels["y1"] + labels["y4"])/2 >= y) & ((labels["y1"] + labels["y4"])/2 < y + tile_size)
                 ].copy()
 
                 # Adjust coordinates of labels for the crop
@@ -266,34 +265,37 @@ if __name__ == "__main__":
 
     model = YOLO("yolo11x-obb.pt")
     
-    # # Size 400
+    # Size 400
+    model.train(
+        data="datasets/GeoMap/data.yaml",
+        epochs=epochs,
+        imgsz=tile_size,  # Image size (same as crop size)
+        batch=batch_size,
+        multi_scale=False,
+        lr0 = 0.002,  
+        lrf = 0.03,      
+        weight_decay = 0.003, 
+        dropout = 0.2,
+        warmup_epochs = 5.0,
+        warmup_momentum = 0.85,
+        warmup_bias_lr = 0.08,
+        plots = True,
+        overlap_mask = False,
+        device=[0, 1] if torch.cuda.is_available() else "CPU",
+    )
+    
+    # Size 150
     # model.train(
     #     data="datasets/GeoMap/data.yaml",
     #     epochs=epochs,
     #     imgsz=tile_size,  # Image size (same as crop size)
     #     batch=batch_size,
     #     multi_scale=True,
-    #     lr0 = 0.003,  
+    #     lr0 = 0.005,  
     #     lrf = 0.05,      
     #     weight_decay = 0.001, 
-    #     dropout = 0.4,
+    #     dropout = 0.3,
     #     plots = True,
     #     overlap_mask = False,
     #     device=[0, 1] if torch.cuda.is_available() else "CPU",
     # )
-    
-    # Size 150
-    model.train(
-        data="datasets/GeoMap/data.yaml",
-        epochs=epochs,
-        imgsz=tile_size,  # Image size (same as crop size)
-        batch=batch_size,
-        multi_scale=True,
-        lr0 = 0.005,  
-        lrf = 0.05,      
-        weight_decay = 0.001, 
-        dropout = 0.2,
-        plots = True,
-        overlap_mask = False,
-        device=[0, 1] if torch.cuda.is_available() else "CPU",
-    )
