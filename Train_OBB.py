@@ -125,21 +125,39 @@ def crop_images_and_labels(image_dir, label_dir, output_image_dir, output_label_
 
     update_txt_file(cropped_txt_file, new_paths)
 
-def elastic_transform(image, alpha, sigma):
+def elastic_transform(image, alpha=None, sigma=None):
+    """
+    Apply elastic transformation while ensuring it doesn't break OpenCV's remap function.
+    """
     random_state = np.random.RandomState(None)
     shape = image.shape[:2]
 
+    # Set alpha and sigma based on image size
+    if alpha is None:
+        alpha = min(shape) * 0.03  
+    if sigma is None:
+        sigma = alpha * 0.1  
+
+    # Generate displacement fields
     dx = gaussian_filter((random_state.rand(*shape) * 2 - 1), sigma, mode="constant", cval=0) * alpha
     dy = gaussian_filter((random_state.rand(*shape) * 2 - 1), sigma, mode="constant", cval=0) * alpha
 
-    x, y = np.meshgrid(np.arange(shape[1]), np.arange(shape[0]))
-    indices = np.reshape(y + dy, (-1, 1)), np.reshape(x + dx, (-1, 1))
+    x, y = np.meshgrid(np.arange(shape[1], dtype=np.float32), np.arange(shape[0], dtype=np.float32))
 
-    return cv2.remap(image, indices[1].astype(np.float32), indices[0].astype(np.float32), cv2.INTER_LINEAR)
+    # Clip indices to stay in range
+    indices_x = np.clip(x + dx, 0, shape[1] - 1).astype(np.float32)
+    indices_y = np.clip(y + dy, 0, shape[0] - 1).astype(np.float32)
+
+    # Ensure indices have the correct shape
+    assert indices_x.shape == shape, f"indices_x shape mismatch: {indices_x.shape} vs {shape}"
+    assert indices_y.shape == shape, f"indices_y shape mismatch: {indices_y.shape} vs {shape}"
+
+    return cv2.remap(image, indices_x, indices_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+
 
 def apply_single_class_augmentation(image, labels, target_class):
     """
-    Apply augmentations to an image and labels, targeting a specific class.
+    Apply augmentations to an image and labels, ensuring labels remain valid for YOLO format.
     """
     aug_image = image.copy()
     aug_labels = labels.copy()
@@ -147,30 +165,44 @@ def apply_single_class_augmentation(image, labels, target_class):
     # Select only target class labels
     target_labels = aug_labels[aug_labels[0] == target_class].copy()
     
-    # Apply random scaling
-    scale_factor = random.uniform(0.6, 1.4)  # Random scale between 80% to 120%
+    # Original dimensions
     height, width = aug_image.shape[:2]
-    aug_image = cv2.resize(aug_image, (int(width * scale_factor), int(height * scale_factor)))
-    
+
+    # Apply random scaling
+    scale_factor = random.uniform(0.6, 1.4)  # Random scale between 60% to 140%
+    new_width, new_height = int(width * scale_factor), int(height * scale_factor)
+    aug_image = cv2.resize(aug_image, (new_width, new_height))
+
     # Adjust label coordinates based on scaling
     for i in range(1, 9):  # Updating all 8 coordinate values
         target_labels[i] *= scale_factor
 
+    # Apply random shifting
     shift_x = random.randint(-20, 20)
     shift_y = random.randint(-20, 20)
     M = np.float32([[1, 0, shift_x], [0, 1, shift_y]])
-    aug_image = cv2.warpAffine(aug_image, M, (width, height))
+    aug_image = cv2.warpAffine(aug_image, M, (new_width, new_height))
 
+    # Adjust labels after shifting
     target_labels.iloc[:, 1::2] += shift_x  
     target_labels.iloc[:, 2::2] += shift_y  
 
+    # Convert image to HSV and modify brightness/saturation
     hsv = cv2.cvtColor(aug_image, cv2.COLOR_BGR2HSV).astype(np.float64)
     hsv[:, :, 1] *= random.uniform(0.8, 1.2)  
     hsv[:, :, 2] *= random.uniform(0.8, 1.2)  
     hsv = np.clip(hsv, 0, 255).astype(np.uint8)
     aug_image = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
 
-    aug_image = elastic_transform(aug_image, alpha=10, sigma=3)
+    # Apply elastic transformation
+    aug_image = elastic_transform(aug_image)
+
+    # **Normalize label coordinates (Fixing YOLO issue)**
+    target_labels.iloc[:, 1::2] /= new_width  # Normalize x-coordinates
+    target_labels.iloc[:, 2::2] /= new_height  # Normalize y-coordinates
+
+    # **Ensure all label values remain in the [0,1] range**
+    target_labels.iloc[:, 1:] = target_labels.iloc[:, 1:].clip(0, 1)
 
     aug_labels.update(target_labels)
     return aug_image, aug_labels
@@ -192,10 +224,10 @@ def balance_classes(image_dir, label_dir, txt_file, class_balance_threshold=100,
     # Calculate class distribution
     label_files = [f for f in os.listdir(label_dir) if f.endswith(".txt")]
     class_counts = {}
-
+    
     for label_file in label_files:
-        labels = pd.read_csv(os.path.join(label_dir, label_file), sep=" ", header=None, dtype=np.float32)
-        for class_id in labels[0].unique():
+        labels = pd.read_csv(os.path.join(label_dir, label_file), sep=" ", header=None)
+        for class_id in labels[0]:
             class_counts[class_id] = class_counts.get(class_id, 0) + 1
     
     print(f"Initial class distribution: {class_counts}")
@@ -207,10 +239,7 @@ def balance_classes(image_dir, label_dir, txt_file, class_balance_threshold=100,
             continue
         
         print(f"Balancing class {class_id} (current count: {count})")
-        images_with_class = [
-            lf for lf in label_files
-            if class_id in pd.read_csv(os.path.join(label_dir, lf), sep=" ", header=None, dtype=np.float32)[0].values
-        ]
+        images_with_class = [lf for lf in label_files if class_id in pd.read_csv(os.path.join(label_dir, lf), sep=" ", header=None)[0].values]
         
         for _ in range(augmentation_repeats):
             for label_file in images_with_class:
@@ -220,19 +249,18 @@ def balance_classes(image_dir, label_dir, txt_file, class_balance_threshold=100,
                 if image is None:
                     continue
                 
-                labels = pd.read_csv(os.path.join(label_dir, label_file), sep=" ", header=None, dtype=np.float32)
+                labels = pd.read_csv(os.path.join(label_dir, label_file), sep=" ", header=None)
                 aug_image, aug_labels = apply_single_class_augmentation(image, labels, class_id)
-
-                unique_id = random.randint(10000, 99999)
-                aug_image_filename = f"{os.path.splitext(label_file)[0]}_aug_{unique_id}.jpg"
+                
+                # Save augmented image
+                aug_image_filename = f"{os.path.splitext(label_file)[0]}_aug_{random.randint(0, 10000)}.jpg"
                 aug_image_path = os.path.join(image_dir, aug_image_filename)
                 cv2.imwrite(aug_image_path, aug_image)
-
-                aug_label_filename = f"{os.path.splitext(label_file)[0]}_aug_{unique_id}.txt"
+                
+                # Save augmented labels
+                aug_label_filename = f"{os.path.splitext(label_file)[0]}_aug_{random.randint(0, 10000)}.txt"
                 aug_label_path = os.path.join(label_dir, aug_label_filename)
                 aug_labels.to_csv(aug_label_path, sep=" ", header=False, index=False)
-
-                new_image_paths.append(aug_image_path)
                 
                 # Add new image path to list for txt file
                 new_image_paths.append(aug_image_path)
@@ -241,7 +269,6 @@ def balance_classes(image_dir, label_dir, txt_file, class_balance_threshold=100,
     update_balanced_txt_file(txt_file, new_image_paths)
 
     print(f"Balanced class distribution: {class_counts}")
-
 
 if __name__ == "__main__":
     
