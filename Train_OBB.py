@@ -12,16 +12,18 @@ import pandas as pd
 import random
 import torch
 from ultralytics import YOLO
+import numpy as np
+from scipy.ndimage import gaussian_filter
 
 # Configuration
-need_cropping = False 
-need_augmentation = False
+need_cropping = True 
+need_augmentation = True
 tile_size = 400
 overlap = 150
 epochs = 300
 batch_size = 16
 object_boundary_threshold = 0.1  # Minimum fraction of the bounding box that must remain in the crop
-class_balance_threshold = 500  # Minimum number of samples per class for balance
+class_balance_threshold = 600  # Minimum number of samples per class for balance
 augmentation_repeats = 10  # Number of times to augment underrepresented classes
 
 def update_txt_file(txt_file, new_paths):
@@ -123,6 +125,18 @@ def crop_images_and_labels(image_dir, label_dir, output_image_dir, output_label_
 
     update_txt_file(cropped_txt_file, new_paths)
 
+def elastic_transform(image, alpha, sigma):
+    random_state = np.random.RandomState(None)
+    shape = image.shape[:2]
+
+    dx = gaussian_filter((random_state.rand(*shape) * 2 - 1), sigma, mode="constant", cval=0) * alpha
+    dy = gaussian_filter((random_state.rand(*shape) * 2 - 1), sigma, mode="constant", cval=0) * alpha
+
+    x, y = np.meshgrid(np.arange(shape[1]), np.arange(shape[0]))
+    indices = np.reshape(y + dy, (-1, 1)), np.reshape(x + dx, (-1, 1))
+
+    return cv2.remap(image, indices[1].astype(np.float32), indices[0].astype(np.float32), cv2.INTER_LINEAR)
+
 def apply_single_class_augmentation(image, labels, target_class):
     """
     Apply augmentations to an image and labels, targeting a specific class.
@@ -134,19 +148,33 @@ def apply_single_class_augmentation(image, labels, target_class):
     target_labels = aug_labels[aug_labels[0] == target_class].copy()
     
     # Apply random scaling
-    scale_factor = random.uniform(0.8, 1.2)  # Random scale between 80% to 120%
+    scale_factor = random.uniform(0.6, 1.4)  # Random scale between 80% to 120%
     height, width = aug_image.shape[:2]
     aug_image = cv2.resize(aug_image, (int(width * scale_factor), int(height * scale_factor)))
     
     # Adjust label coordinates based on scaling
     for i in range(1, 9):  # Updating all 8 coordinate values
         target_labels[i] *= scale_factor
-    
-    # Change brightness and contrast
-    aug_image = cv2.convertScaleAbs(aug_image, alpha=1.2, beta=50)
+
+    shift_x = random.randint(-20, 20)
+    shift_y = random.randint(-20, 20)
+    M = np.float32([[1, 0, shift_x], [0, 1, shift_y]])
+    aug_image = cv2.warpAffine(aug_image, M, (width, height))
+
+    target_labels.iloc[:, 1::2] += shift_x  
+    target_labels.iloc[:, 2::2] += shift_y  
+
+    hsv = cv2.cvtColor(aug_image, cv2.COLOR_BGR2HSV).astype(np.float64)
+    hsv[:, :, 1] *= random.uniform(0.8, 1.2)  
+    hsv[:, :, 2] *= random.uniform(0.8, 1.2)  
+    hsv = np.clip(hsv, 0, 255).astype(np.uint8)
+    aug_image = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+
+    aug_image = elastic_transform(aug_image, alpha=10, sigma=3)
 
     aug_labels.update(target_labels)
     return aug_image, aug_labels
+
 
 def update_balanced_txt_file(txt_file, new_paths):
     """
@@ -164,10 +192,10 @@ def balance_classes(image_dir, label_dir, txt_file, class_balance_threshold=100,
     # Calculate class distribution
     label_files = [f for f in os.listdir(label_dir) if f.endswith(".txt")]
     class_counts = {}
-    
+
     for label_file in label_files:
-        labels = pd.read_csv(os.path.join(label_dir, label_file), sep=" ", header=None)
-        for class_id in labels[0]:
+        labels = pd.read_csv(os.path.join(label_dir, label_file), sep=" ", header=None, dtype=np.float32)
+        for class_id in labels[0].unique():
             class_counts[class_id] = class_counts.get(class_id, 0) + 1
     
     print(f"Initial class distribution: {class_counts}")
@@ -179,7 +207,10 @@ def balance_classes(image_dir, label_dir, txt_file, class_balance_threshold=100,
             continue
         
         print(f"Balancing class {class_id} (current count: {count})")
-        images_with_class = [lf for lf in label_files if class_id in pd.read_csv(os.path.join(label_dir, lf), sep=" ", header=None)[0].values]
+        images_with_class = [
+            lf for lf in label_files
+            if class_id in pd.read_csv(os.path.join(label_dir, lf), sep=" ", header=None, dtype=np.float32)[0].values
+        ]
         
         for _ in range(augmentation_repeats):
             for label_file in images_with_class:
@@ -189,18 +220,19 @@ def balance_classes(image_dir, label_dir, txt_file, class_balance_threshold=100,
                 if image is None:
                     continue
                 
-                labels = pd.read_csv(os.path.join(label_dir, label_file), sep=" ", header=None)
+                labels = pd.read_csv(os.path.join(label_dir, label_file), sep=" ", header=None, dtype=np.float32)
                 aug_image, aug_labels = apply_single_class_augmentation(image, labels, class_id)
-                
-                # Save augmented image
-                aug_image_filename = f"{os.path.splitext(label_file)[0]}_aug_{random.randint(0, 10000)}.jpg"
+
+                unique_id = random.randint(10000, 99999)
+                aug_image_filename = f"{os.path.splitext(label_file)[0]}_aug_{unique_id}.jpg"
                 aug_image_path = os.path.join(image_dir, aug_image_filename)
                 cv2.imwrite(aug_image_path, aug_image)
-                
-                # Save augmented labels
-                aug_label_filename = f"{os.path.splitext(label_file)[0]}_aug_{random.randint(0, 10000)}.txt"
+
+                aug_label_filename = f"{os.path.splitext(label_file)[0]}_aug_{unique_id}.txt"
                 aug_label_path = os.path.join(label_dir, aug_label_filename)
                 aug_labels.to_csv(aug_label_path, sep=" ", header=False, index=False)
+
+                new_image_paths.append(aug_image_path)
                 
                 # Add new image path to list for txt file
                 new_image_paths.append(aug_image_path)
@@ -275,10 +307,11 @@ if __name__ == "__main__":
         lr0 = 0.002,  
         lrf = 0.03,      
         weight_decay = 0.003, 
-        dropout = 0.2,
+        dropout = 0.3,
         warmup_epochs = 5.0,
         warmup_momentum = 0.85,
         warmup_bias_lr = 0.08,
+        patience=0,
         plots = True,
         overlap_mask = False,
         device=[0, 1] if torch.cuda.is_available() else "CPU",
