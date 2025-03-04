@@ -18,9 +18,9 @@ from scipy.ndimage import gaussian_filter
 # Configuration
 need_cropping = True 
 need_augmentation = True
-tile_size = 400
+tile_size = 416
 overlap = 150
-epochs = 300
+epochs = 150
 batch_size = 16
 object_boundary_threshold = 0.1  # Minimum fraction of the bounding box that must remain in the crop
 class_balance_threshold = 600  # Minimum number of samples per class for balance
@@ -334,10 +334,10 @@ if __name__ == "__main__":
         lr0 = 0.002,  
         lrf = 0.03,      
         weight_decay = 0.003, 
-        dropout = 0.3,
-        warmup_epochs = 5.0,
-        warmup_momentum = 0.85,
-        warmup_bias_lr = 0.08,
+        dropout = 0.4,
+        # warmup_epochs = 5.0,
+        # warmup_momentum = 0.85,
+        # warmup_bias_lr = 0.08,
         patience=0,
         plots = True,
         overlap_mask = False,
