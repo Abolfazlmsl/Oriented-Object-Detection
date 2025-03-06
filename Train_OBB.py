@@ -18,8 +18,8 @@ from scipy.ndimage import gaussian_filter
 # Configuration
 need_cropping = True 
 need_augmentation = True
-tile_size = 416
-overlap = 150
+tile_size = 128
+overlap = 50
 epochs = 150
 batch_size = 16
 object_boundary_threshold = 0.1  # Minimum fraction of the bounding box that must remain in the crop
@@ -324,38 +324,38 @@ if __name__ == "__main__":
 
     model = YOLO("yolo11x-obb.pt")
     
-    # Size 400
-    model.train(
-        data="datasets/GeoMap/data.yaml",
-        epochs=epochs,
-        imgsz=tile_size,  # Image size (same as crop size)
-        batch=batch_size,
-        multi_scale=False,
-        lr0 = 0.002,  
-        lrf = 0.03,      
-        weight_decay = 0.003, 
-        dropout = 0.4,
-        # warmup_epochs = 5.0,
-        # warmup_momentum = 0.85,
-        # warmup_bias_lr = 0.08,
-        patience=0,
-        plots = True,
-        overlap_mask = False,
-        device=[0, 1] if torch.cuda.is_available() else "CPU",
-    )
-    
-    # Size 150
+    # # Size 416
     # model.train(
     #     data="datasets/GeoMap/data.yaml",
     #     epochs=epochs,
     #     imgsz=tile_size,  # Image size (same as crop size)
     #     batch=batch_size,
-    #     multi_scale=True,
-    #     lr0 = 0.005,  
-    #     lrf = 0.05,      
-    #     weight_decay = 0.001, 
-    #     dropout = 0.3,
+    #     multi_scale=False,
+    #     lr0 = 0.002,  
+    #     lrf = 0.03,      
+    #     weight_decay = 0.003, 
+    #     dropout = 0.4,
+    #     # warmup_epochs = 5.0,
+    #     # warmup_momentum = 0.85,
+    #     # warmup_bias_lr = 0.08,
+    #     patience=0,
     #     plots = True,
     #     overlap_mask = False,
     #     device=[0, 1] if torch.cuda.is_available() else "CPU",
     # )
+    
+    # Size 128
+    model.train(
+        data="datasets/GeoMap/data.yaml",
+        epochs=epochs,
+        imgsz=tile_size,  # Image size (same as crop size)
+        batch=batch_size,
+        multi_scale=True,
+        lr0 = 0.005,  
+        lrf = 0.05,      
+        weight_decay = 0.001, 
+        dropout = 0.3,
+        plots = True,
+        overlap_mask = False,
+        device=[0, 1] if torch.cuda.is_available() else "CPU",
+    )

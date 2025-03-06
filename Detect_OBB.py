@@ -13,10 +13,10 @@ import numpy as np
 import pandas as pd
 from shapely.geometry import Polygon
 
-tile_sizes = [150]
-overlaps = [100]
+tile_sizes = [128, 416]
+overlaps = [70, 260]
 iou_threshold = 0.2
-models = [YOLO("best150.pt")]
+models = [YOLO("best128.pt"), YOLO("best416.pt")]
 
 # Define colors for different classes
 CLASS_COLORS = {
@@ -238,7 +238,7 @@ def process_image(image_path, output_dir):
         text_x = min(x1, x2, x3, x4)
         text_y = min(y1, y2, y3, y4) - 10  # Shift text above the box
         cv2.putText(result_image, f"{label} {conf:.2f}", (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-        
+
         data.append([label, x1, y1, x2, y2, x3, y3, x4, y4, conf, angle])
     
     output_path = os.path.join(output_dir, os.path.basename(image_path).replace(".jpg", "_detected.jpg").replace(".png", "_detected.png"))
