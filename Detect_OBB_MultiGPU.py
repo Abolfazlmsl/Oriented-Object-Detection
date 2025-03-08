@@ -12,14 +12,19 @@ from ultralytics import YOLO
 import numpy as np
 import pandas as pd
 from shapely.geometry import Polygon
+import torch
 import time
+import multiprocessing
 
 start_time = time.time()
+
+num_gpus = torch.cuda.device_count()
+devices = [torch.device(f"cuda:{i}") for i in range(num_gpus)] if num_gpus > 0 else [torch.device("cpu")]
 
 tile_sizes = [128, 416]
 overlaps = [20, 50]
 iou_threshold = 0.2
-models = [YOLO("best128.pt"), YOLO("best416.pt")]
+models = ["best128.pt", "best416.pt"]
 
 # Define colors for different classes
 CLASS_COLORS = {
@@ -128,10 +133,11 @@ def compute_polygon_iou(box1, box2):
     union = poly1.area + poly2.area - intersection
     return intersection / union if union > 0 else 0.0
 
-def detect_symbols(image, model, tile_size, overlap):
+def detect_symbols(image, model, tile_size, overlap, device, output_queue):
     """
     Detect objects in an image using a given model, tile size, and overlap.
     """
+    model = YOLO(model).to(device)
     h, w, _ = image.shape
     step = tile_size - overlap
     detections = []
@@ -158,8 +164,8 @@ def detect_symbols(image, model, tile_size, overlap):
                 crop_detections.append((x1 + x, y1 + y, x2 + x, y2 + y, x3 + x, y3 + y,\
                                         x4 + x, y4 + y, cls, conf, angle))
             detections.extend(merge_detections(crop_detections, iou_threshold))
-                    
-    return detections
+    
+    output_queue.put(detections)
 
 def merge_detections(detections, iou_threshold=0.5, excluse_check=True):
     """
@@ -172,7 +178,7 @@ def merge_detections(detections, iou_threshold=0.5, excluse_check=True):
     Returns:
     list: Filtered list of detections.
     """
-    
+
     if not detections:
         return []
     
@@ -220,13 +226,24 @@ def process_image(image_path, output_dir):
     Process an image by applying object detection at multiple tile sizes and merging the results.
     """
     image = cv2.imread(image_path)
+    output_queue = multiprocessing.Queue()
+    processes = []
+    for device in devices:
+        for model, tile_size, overlap in zip(models, tile_sizes, overlaps):
+            process = multiprocessing.Process(target=detect_symbols, args=(image, model, tile_size, overlap, device, output_queue))
+            processes.append(process)
+            process.start()
+    
     all_detections = []
-    for tile_size, overlap, model in zip(tile_sizes, overlaps, models):
-        all_detections.extend(detect_symbols(image, model, tile_size, overlap))
-    
+    for _ in range(len(processes)):
+        all_detections.extend(output_queue.get())
+        
+    for process in processes:
+        process.join()
+        
     print("--- %s seconds ---" % (time.time() - start_time))
-    
-    merged_detections = merge_detections(all_detections, iou_threshold, False)
+        
+    merged_detections = merge_detections(all_detections, iou_threshold)
     result_image = image.copy()
     image_name = os.path.basename(image_path)
     excel_path = os.path.join(output_dir, image_name.replace(".jpg", ".xlsx").replace(".png", ".xlsx"))
