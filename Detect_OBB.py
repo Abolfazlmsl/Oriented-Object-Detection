@@ -12,6 +12,9 @@ from ultralytics import YOLO
 import numpy as np
 import pandas as pd
 from shapely.geometry import Polygon
+import time
+
+start_time = time.time()
 
 tile_sizes = [128, 416]
 overlaps = [70, 260]
@@ -217,6 +220,8 @@ def process_image(image_path, output_dir):
     for tile_size, overlap, model in zip(tile_sizes, overlaps, models):
         all_detections.extend(detect_symbols(image, model, tile_size, overlap))
     
+    print("--- %s seconds ---" % (time.time() - start_time))
+    
     merged_detections = merge_detections(all_detections, iou_threshold)
     result_image = image.copy()
     image_name = os.path.basename(image_path)
@@ -258,3 +263,5 @@ for image_file in os.listdir(input_dir):
         print(f"Processing {image_file}...")
         process_image(os.path.join(input_dir, image_file), output_dir)
         print(f"Results saved for {image_file}")
+
+print("--- %s seconds ---" % (time.time() - start_time))
