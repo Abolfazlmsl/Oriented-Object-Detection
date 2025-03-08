@@ -243,7 +243,7 @@ def process_image(image_path, output_dir):
         
     print("--- %s seconds ---" % (time.time() - start_time))
         
-    merged_detections = merge_detections(all_detections, iou_threshold)
+    merged_detections = merge_detections(all_detections, iou_threshold, False)
     result_image = image.copy()
     image_name = os.path.basename(image_path)
     excel_path = os.path.join(output_dir, image_name.replace(".jpg", ".xlsx").replace(".png", ".xlsx"))
