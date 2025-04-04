@@ -16,11 +16,11 @@ import numpy as np
 from scipy.ndimage import gaussian_filter
 
 # Configuration
-need_cropping = True 
-need_augmentation = True
+need_cropping = False 
+need_augmentation = False
 tile_size = 128
 overlap = 50
-epochs = 150
+epochs = 300
 batch_size = 16
 object_boundary_threshold = 0.1  # Minimum fraction of the bounding box that must remain in the crop
 class_balance_threshold = 600  # Minimum number of samples per class for balance
@@ -356,6 +356,7 @@ if __name__ == "__main__":
         weight_decay = 0.001, 
         dropout = 0.3,
         plots = True,
+        patience=10000,
         overlap_mask = False,
         device=[0, 1] if torch.cuda.is_available() else "CPU",
     )

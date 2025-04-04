@@ -17,7 +17,7 @@ import time
 start_time = time.time()
 
 tile_sizes = [128, 416]
-overlaps = [20, 50]
+overlaps = [50, 150]
 iou_threshold = 0.2
 models = [YOLO("best128.pt"), YOLO("best416.pt")]
 
@@ -66,7 +66,7 @@ CLASS_THRESHOLDS = {
     4: 0.8,  # Hillside
     5: 0.7,  # Feuchte
     6: 0.7,  # Torf
-    7: 0.45,  # Bergsturz
+    7: 0.92,  # Bergsturz
     8: 0.7,  # Landslide 2
     9: 0.7,  # Spring 2
     10: 0.7,  # Spring 3
