@@ -17,7 +17,7 @@ import time
 start_time = time.time()
 
 tile_sizes = [128, 416]
-overlaps = [50, 150]
+overlaps = [20, 50]
 iou_threshold = 0.2
 models = [YOLO("best128.pt"), YOLO("best416.pt")]
 
@@ -59,7 +59,7 @@ CLASS_NAMES = {
 
 # Add threshold for each class
 CLASS_THRESHOLDS = {
-    0: 0.7,  # Landslide 1
+    0: 0.65,  # Landslide 1
     1: 0.8,  # Strike
     2: 0.8,  # Spring 1
     3: 0.8,  # Minepit 1
@@ -67,7 +67,7 @@ CLASS_THRESHOLDS = {
     5: 0.7,  # Feuchte
     6: 0.7,  # Torf
     7: 0.92,  # Bergsturz
-    8: 0.7,  # Landslide 2
+    8: 0.8,  # Landslide 2
     9: 0.7,  # Spring 2
     10: 0.7,  # Spring 3
     11: 0.6,  # Minepit 2
@@ -247,10 +247,26 @@ def process_image(image_path, output_dir):
         text_x = min(x1, x2, x3, x4)
         text_y = min(y1, y2, y3, y4) - 10  # Shift text above the box
         cv2.putText(result_image, f"{label} {conf:.2f}", (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+        
+        # Draw polygon
+        # points = np.array([[x1, y1], [x2, y2], [x3, y3], [x4, y4]], np.int32)
+        # cv2.polylines(result_image, [points], isClosed=True, color=color, thickness=2)
+        
+        # # Annotate corners with numbers 1 to 4
+        # corner_coords = [(x1, y1), (x2, y2), (x3, y3), (x4, y4)]
+        # for idx, (px, py) in enumerate(corner_coords, start=1):
+        #     cv2.putText(result_image, str(idx), (px + 3, py - 3), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
+        #     cv2.putText(result_image, str(idx), (px + 3, py - 3), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        
+        # # Place label text above the topmost y-coordinate of the box
+        # text_x = min(x1, x2, x3, x4)
+        # text_y = min(y1, y2, y3, y4) - 15  # Shift text above the corner numbers
+        # cv2.putText(result_image, f"{label} {conf:.2f}", (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
 
         data.append([label, x1, y1, x2, y2, x3, y3, x4, y4, conf, angle])
     
-    output_path = os.path.join(output_dir, os.path.basename(image_path).replace(".jpg", "_detected.jpg").replace(".png", "_detected.png"))
+    output_path = os.path.join(output_dir, os.path.basename(image_path).replace(".jpg", "_detected.jpg").replace(".png", "_detected.jpg"))
     cv2.imwrite(output_path, result_image)
     
     df = pd.DataFrame(data, columns=["Class", "X1", "Y1", "X2", "Y2", "X3", "Y3", "X4", "Y4", "Confidence", "Angle"])
