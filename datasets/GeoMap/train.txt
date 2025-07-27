@@ -26,7 +26,6 @@ datasets/GeoMap/images/train/6004.png
 datasets/GeoMap/images/train/6005.png
 datasets/GeoMap/images/train/6006.png
 datasets/GeoMap/images/train/6007.png
-datasets/GeoMap/images/train/6009.png
 datasets/GeoMap/images/train/6013_Bingen.png
 datasets/GeoMap/images/train/6014_Ingelheim.png
 datasets/GeoMap/images/train/6015_Mainz.png

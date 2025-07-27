@@ -122,7 +122,7 @@ def compute_polygon_iou(box1, box2):
     poly2 = Polygon([(box2[i], box2[i+1]) for i in range(0, 8, 2)])
 
     if not poly1.is_valid or not poly2.is_valid:
-        return 0.0  # If polygons are invalid, return IoU as 0
+        return 0.0 
 
     intersection = poly1.intersection(poly2).area
     union = poly1.area + poly2.area - intersection
@@ -176,7 +176,7 @@ def merge_detections(detections, iou_threshold=0.5, excluse_check=True):
     if not detections:
         return []
     
-    detections.sort(key=lambda x: x[10], reverse=True)  # Sort by confidence (higher first)
+    detections.sort(key=lambda x: x[10], reverse=True)  
     merged = []
     excluded_boxes = [det[:11] for det in detections if det[8] in EXCLUDED_CLASSES]
     
@@ -234,7 +234,7 @@ def process_image(image_path, output_dir):
     data = []
     for x1, y1, x2, y2, x3, y3, x4, y4, cls, conf, angle in merged_detections:
         if cls in EXCLUDED_CLASSES:
-            continue  # Ignore excluded classes
+            continue  
         
         color = CLASS_COLORS.get(cls, (0, 255, 255))
         label = CLASS_NAMES.get(cls, f"Class{cls}")
@@ -243,7 +243,7 @@ def process_image(image_path, output_dir):
         points = np.array([[x1, y1], [x2, y2], [x3, y3], [x4, y4]], np.int32)
         cv2.polylines(result_image, [points], isClosed=True, color=color, thickness=2)
         
-        # Place label text above the topmost y-coordinate of the box
+        # Place label text above the box
         text_x = min(x1, x2, x3, x4)
         text_y = min(y1, y2, y3, y4) - 10  # Shift text above the box
         cv2.putText(result_image, f"{label} {conf:.2f}", (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
@@ -272,12 +272,10 @@ def process_image(image_path, output_dir):
     df = pd.DataFrame(data, columns=["Class", "X1", "Y1", "X2", "Y2", "X3", "Y3", "X4", "Y4", "Confidence", "Angle"])
     df.to_excel(excel_path, index=False)
 
-# Define input and output directories
 input_dir = "Input"
 output_dir = "Output"
 os.makedirs(output_dir, exist_ok=True)
 
-# Process all images in the input directory
 for image_file in os.listdir(input_dir):
     if image_file.lower().endswith((".png", ".jpg", ".jpeg")):
         print(f"Processing {image_file}...")

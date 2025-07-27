@@ -16,8 +16,8 @@ import numpy as np
 from scipy.ndimage import gaussian_filter
 
 # Configuration
-need_cropping = False 
-need_augmentation = False
+need_cropping = True 
+need_augmentation = True
 tile_size = 128
 overlap = 50
 epochs = 300
@@ -39,8 +39,8 @@ def convert_to_grayscale(image):
     Convert an image to grayscale and ensure it has 3 channels.
     """
     gray_image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    gray_image = cv2.cvtColor(gray_image, cv2.COLOR_GRAY2BGR)  # Ensure 3-channel format for consistency
-    return image
+    gray_image = cv2.cvtColor(gray_image, cv2.COLOR_GRAY2BGR)  
+    return gray_image
 
 def crop_images_and_labels(image_dir, label_dir, output_image_dir, output_label_dir, txt_file, cropped_txt_file, tile_size=512, overlap=0):
     """
@@ -73,7 +73,6 @@ def crop_images_and_labels(image_dir, label_dir, output_image_dir, output_label_
         labels = pd.read_csv(label_path, sep=" ", header=None)
         labels.columns = ["class", "x1", "y1", "x2", "y2", "x3", "y3", "x4", "y4"]
         
-        # Convert normalized coordinates to absolute values
         labels[["x1", "x2", "x3", "x4"]] *= w
         labels[["y1", "y2", "y3", "y4"]] *= h
         
@@ -85,24 +84,20 @@ def crop_images_and_labels(image_dir, label_dir, output_image_dir, output_label_
                 if crop.shape[0] != tile_size or crop.shape[1] != tile_size:
                     continue
 
-                # Find labels within the crop region
                 tile_labels = labels[
                     ((labels["x1"] + labels["x4"])/2 >= x) & ((labels["x1"] + labels["x4"])/2 < x + tile_size) &
                     ((labels["y1"] + labels["y4"])/2 >= y) & ((labels["y1"] + labels["y4"])/2 < y + tile_size)
                 ].copy()
 
-                # Adjust coordinates of labels for the crop
                 tile_labels[["x1", "x2", "x3", "x4"]] -= x
                 tile_labels[["y1", "y2", "y3", "y4"]] -= y
                 
                 tile_labels[["x1", "x2", "x3", "x4"]] = tile_labels[["x1", "x2", "x3", "x4"]].clip(0, tile_size)
                 tile_labels[["y1", "y2", "y3", "y4"]] = tile_labels[["y1", "y2", "y3", "y4"]].clip(0, tile_size)
 
-                # Normalize coordinates with respect to tile size
                 tile_labels[["x1", "x2", "x3", "x4"]] /= tile_size
                 tile_labels[["y1", "y2", "y3", "y4"]] /= tile_size
 
-                # Skip saving this crop if no valid labels remain
                 if tile_labels.empty:
                     continue
 
@@ -132,23 +127,19 @@ def elastic_transform(image, alpha=None, sigma=None):
     random_state = np.random.RandomState(None)
     shape = image.shape[:2]
 
-    # Set alpha and sigma based on image size
     if alpha is None:
         alpha = min(shape) * 0.03  
     if sigma is None:
         sigma = alpha * 0.1  
 
-    # Generate displacement fields
     dx = gaussian_filter((random_state.rand(*shape) * 2 - 1), sigma, mode="constant", cval=0) * alpha
     dy = gaussian_filter((random_state.rand(*shape) * 2 - 1), sigma, mode="constant", cval=0) * alpha
 
     x, y = np.meshgrid(np.arange(shape[1], dtype=np.float32), np.arange(shape[0], dtype=np.float32))
 
-    # Clip indices to stay in range
     indices_x = np.clip(x + dx, 0, shape[1] - 1).astype(np.float32)
     indices_y = np.clip(y + dy, 0, shape[0] - 1).astype(np.float32)
 
-    # Ensure indices have the correct shape
     assert indices_x.shape == shape, f"indices_x shape mismatch: {indices_x.shape} vs {shape}"
     assert indices_y.shape == shape, f"indices_y shape mismatch: {indices_y.shape} vs {shape}"
 
@@ -162,19 +153,18 @@ def apply_single_class_augmentation(image, labels, target_class):
     aug_image = image.copy()
     aug_labels = labels.copy()
 
-    # Select only target class labels
     target_labels = aug_labels[aug_labels[0] == target_class].copy()
     
     # Original dimensions
     height, width = aug_image.shape[:2]
 
     # Apply random scaling
-    scale_factor = random.uniform(0.6, 1.4)  # Random scale between 60% to 140%
+    scale_factor = random.uniform(0.6, 1.4)  
     new_width, new_height = int(width * scale_factor), int(height * scale_factor)
     aug_image = cv2.resize(aug_image, (new_width, new_height))
 
     # Adjust label coordinates based on scaling
-    for i in range(1, 9):  # Updating all 8 coordinate values
+    for i in range(1, 9):  
         target_labels[i] *= scale_factor
 
     # Apply random shifting
@@ -197,11 +187,9 @@ def apply_single_class_augmentation(image, labels, target_class):
     # Apply elastic transformation
     aug_image = elastic_transform(aug_image)
 
-    # **Normalize label coordinates (Fixing YOLO issue)**
-    target_labels.iloc[:, 1::2] /= new_width  # Normalize x-coordinates
-    target_labels.iloc[:, 2::2] /= new_height  # Normalize y-coordinates
+    target_labels.iloc[:, 1::2] /= new_width 
+    target_labels.iloc[:, 2::2] /= new_height  
 
-    # **Ensure all label values remain in the [0,1] range**
     target_labels.iloc[:, 1:] = target_labels.iloc[:, 1:].clip(0, 1)
 
     aug_labels.update(target_labels)
@@ -212,7 +200,7 @@ def update_balanced_txt_file(txt_file, new_paths):
     """
     Append new paths of augmented images to the .txt file.
     """
-    with open(txt_file, "a") as f:  # Append mode
+    with open(txt_file, "a") as f: 
         for path in new_paths:
             f.write(f"{path}\n")
 
@@ -221,7 +209,7 @@ def balance_classes(image_dir, label_dir, txt_file, class_balance_threshold=100,
     Balance classes by oversampling underrepresented classes with augmentations,
     and update the txt file with new image paths.
     """
-    # Calculate class distribution
+
     label_files = [f for f in os.listdir(label_dir) if f.endswith(".txt")]
     class_counts = {}
     
@@ -328,7 +316,7 @@ if __name__ == "__main__":
     # model.train(
     #     data="datasets/GeoMap/data.yaml",
     #     epochs=epochs,
-    #     imgsz=tile_size,  # Image size (same as crop size)
+    #     imgsz=tile_size, 
     #     batch=batch_size,
     #     multi_scale=False,
     #     lr0 = 0.002,  
@@ -348,7 +336,7 @@ if __name__ == "__main__":
     model.train(
         data="datasets/GeoMap/data.yaml",
         epochs=epochs,
-        imgsz=tile_size,  # Image size (same as crop size)
+        imgsz=tile_size,  
         batch=batch_size,
         multi_scale=True,
         lr0 = 0.005,  
