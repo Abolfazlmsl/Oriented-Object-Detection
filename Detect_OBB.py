@@ -59,7 +59,7 @@ CLASS_NAMES = {
 
 # Add threshold for each class
 CLASS_THRESHOLDS = {
-    0: 0.65,  # Landslide 1
+    0: 0.6,  # Landslide 1
     1: 0.8,  # Strike
     2: 0.8,  # Spring 1
     3: 0.8,  # Minepit 1
