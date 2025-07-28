@@ -9,3 +9,4 @@ datasets/GeoMap/images/val/*
 datasets/GeoMap/cropped/
 /datasets/GeoMap/val_cropped.txt
 /datasets/GeoMap/train_cropped.txt
+mmdata

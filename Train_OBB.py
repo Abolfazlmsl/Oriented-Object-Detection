@@ -16,11 +16,11 @@ import numpy as np
 from scipy.ndimage import gaussian_filter
 
 # Configuration
-need_cropping = True 
-need_augmentation = True
+need_cropping = False 
+need_augmentation = False
 tile_size = 128
 overlap = 50
-epochs = 300
+epochs = 150
 batch_size = 16
 object_boundary_threshold = 0.1  # Minimum fraction of the bounding box that must remain in the crop
 class_balance_threshold = 600  # Minimum number of samples per class for balance
@@ -111,6 +111,14 @@ def crop_images_and_labels(image_dir, label_dir, output_image_dir, output_label_
                 tile_label_path = os.path.join(output_label_dir, tile_label_filename)
                 tile_labels.to_csv(tile_label_path, sep=" ", header=False, index=False)
 
+
+                if not os.path.exists(tile_image_path) or tile_labels.empty:
+                    if os.path.exists(tile_image_path):
+                        os.remove(tile_image_path)
+                    if os.path.exists(tile_label_path):
+                        os.remove(tile_label_path)
+                    continue
+                
                 # Store new image path for updating the txt file
                 new_paths.append(tile_image_path)
 
@@ -240,13 +248,14 @@ def balance_classes(image_dir, label_dir, txt_file, class_balance_threshold=100,
                 labels = pd.read_csv(os.path.join(label_dir, label_file), sep=" ", header=None)
                 aug_image, aug_labels = apply_single_class_augmentation(image, labels, class_id)
                 
+                unique_id = random.randint(0, 10000)
                 # Save augmented image
-                aug_image_filename = f"{os.path.splitext(label_file)[0]}_aug_{random.randint(0, 10000)}.jpg"
+                aug_image_filename = f"{os.path.splitext(label_file)[0]}_aug_{unique_id}.jpg"
                 aug_image_path = os.path.join(image_dir, aug_image_filename)
                 cv2.imwrite(aug_image_path, aug_image)
                 
                 # Save augmented labels
-                aug_label_filename = f"{os.path.splitext(label_file)[0]}_aug_{random.randint(0, 10000)}.txt"
+                aug_label_filename = f"{os.path.splitext(label_file)[0]}_aug_{unique_id}.txt"
                 aug_label_path = os.path.join(label_dir, aug_label_filename)
                 aug_labels.to_csv(aug_label_path, sep=" ", header=False, index=False)
                 
