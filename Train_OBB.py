@@ -16,12 +16,12 @@ import numpy as np
 from scipy.ndimage import gaussian_filter
 
 # Configuration
-need_cropping = True 
-need_augmentation = True
+need_cropping = False 
+need_augmentation = False
 tile_size = 416
 overlap = 150
 epochs = 150
-batch_size = 16
+batch_size = 32
 object_boundary_threshold = 0.1  # Minimum fraction of the bounding box that must remain in the crop
 class_balance_threshold = 400  # Minimum number of samples per class for balance
 augmentation_repeats = 2  # Number of times to augment underrepresented classes
@@ -350,7 +350,7 @@ if __name__ == "__main__":
         lr0 = 0.002,  
         lrf = 0.05,      
         weight_decay = 0.001, 
-        dropout = 0.2,
+        #dropout = 0.2,
         # warmup_epochs = 5.0,
         # warmup_momentum = 0.85,
         # warmup_bias_lr = 0.08,
@@ -370,7 +370,7 @@ if __name__ == "__main__":
     #     lr0 = 0.005,  
     #     lrf = 0.05,      
     #     weight_decay = 0.001, 
-    #     dropout = 0.3,
+    #     dropout = 0.2,
     #     plots = True,
     #     patience=10000,
     #     overlap_mask = False,

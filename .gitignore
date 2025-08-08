@@ -3,6 +3,7 @@ Output/*
 best128.pt
 best416.pt
 yolo11x-obb.pt
+yolov8x-obb.pt
 yolo11n.pt
 datasets/GeoMap/images/train/*
 datasets/GeoMap/images/val/*
