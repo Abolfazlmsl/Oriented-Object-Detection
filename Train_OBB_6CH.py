@@ -27,12 +27,12 @@ import sys, subprocess, inspect
 # Tiling / dataset
 TILE_SIZE = 128
 OVERLAP = 50
-NEED_CROPPING = False
-NEED_AUGMENTATION = False
+NEED_CROPPING = True
+NEED_AUGMENTATION = True
 Dual_GPU = True
 
 # Training
-EPOCHS = 1
+EPOCHS = 150
 BATCH_SIZE = 32
 WORKERS = 2
 CACHE = False       
@@ -117,8 +117,8 @@ def crop_images_and_labels(image_dir, label_dir, out_img_dir, out_lbl_dir, list_
 
         tid = 0
         # centroid-based selection (x1,y1 to x4,y4 ordering assumed consistent)
-        cx = (df["x1"] + df["x3"]) / 2.0
-        cy = (df["y1"] + df["y3"]) / 2.0
+        cx = (df["x1"] + df["x4"]) / 2.0
+        cy = (df["y1"] + df["y4"]) / 2.0
 
         for y in range(0, h, step):
             for x in range(0, w, step):
@@ -453,26 +453,8 @@ def on_val_batch_start(*args, **kwargs):
 # ==============================
 if __name__ == "__main__":
             
-    if Dual_GPU:
-        if os.getenv("RANK") is None:  
-            DEV = "0,1"  
-            if "," in DEV:  
-                nproc = len(DEV.split(","))
-                os.environ.setdefault("CUDA_VISIBLE_DEVICES", DEV)
-                os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-                os.environ.setdefault("MASTER_PORT", "29501")  
-                os.environ.setdefault("TORCH_DISTRIBUTED_DEBUG", "DETAIL")
-                os.environ.setdefault("NCCL_IB_DISABLE", "1")
-                os.environ.setdefault("NCCL_P2P_DISABLE", "1")
-                this = os.path.abspath(inspect.getfile(sys.modules[__name__]))
-                cmd = [sys.executable, "-m", "torch.distributed.run",
-                       "--nproc_per_node", str(nproc),
-                       "--master_port", os.environ["MASTER_PORT"],
-                       this]
-                raise SystemExit(subprocess.run(cmd, check=True).returncode)
-            
     # 1) Tiling 
-    if NEED_CROPPING:
+    if NEED_CROPPING and os.getenv("RANK") is None:
         crop_images_and_labels(
             image_dir=TRAIN_IMG_DIR,
             label_dir=TRAIN_LBL_DIR,
@@ -493,7 +475,7 @@ if __name__ == "__main__":
         )
 
     # 2) Class balancing on CROPPED tiles
-    if NEED_AUGMENTATION:
+    if NEED_AUGMENTATION and os.getenv("RANK") is None:
         balance_classes(
             image_dir=TRAIN_OUT_IMG_DIR,
             label_dir=TRAIN_OUT_LBL_DIR,
@@ -532,9 +514,28 @@ if __name__ == "__main__":
         hsv_h=0.0, hsv_s=0.0, hsv_v=0.0,
         amp=False
     )
+
+    
+    if Dual_GPU:
+        if os.getenv("RANK") is None:  
+            DEV = "0,1"  
+            if "," in DEV:  
+                nproc = len(DEV.split(","))
+                os.environ.setdefault("CUDA_VISIBLE_DEVICES", DEV)
+                os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+                os.environ.setdefault("MASTER_PORT", "29501")  
+                os.environ.setdefault("TORCH_DISTRIBUTED_DEBUG", "DETAIL")
+                os.environ.setdefault("NCCL_IB_DISABLE", "1")
+                os.environ.setdefault("NCCL_P2P_DISABLE", "1")
+                this = os.path.abspath(inspect.getfile(sys.modules[__name__]))
+                cmd = [sys.executable, "-m", "torch.distributed.run",
+                        "--nproc_per_node", str(nproc),
+                        "--master_port", os.environ["MASTER_PORT"],
+                        this]
+                raise SystemExit(subprocess.run(cmd, check=True).returncode)
     
     trainer = MultiChannelTrainer(overrides=overrides)
     trainer.add_callback("on_fit_start", on_fit_start_cb)
     trainer.add_callback("on_preprocess_batch_end", on_preprocess_batch_end)
-    trainer.add_callback("on_val_batch_start", on_val_batch_start)
+    trainer.add_callback("on_val_batch_start", on_val_batch_start)           
     trainer.train()
