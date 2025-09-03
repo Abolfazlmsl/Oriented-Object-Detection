@@ -19,12 +19,11 @@ import time
 start_time = time.time()
 
 calculate_metrics = True
-tile_sizes = [128]
-overlaps = [20]
+tile_sizes = [128, 416]
+overlaps = [20, 50]
 iou_thr = 0.25
 iou_threshold = 0.2
-DEVICE = 0 if torch.cuda.is_available() else "cpu"
-models = [YOLO("best128.pt").to(DEVICE)]
+models = [YOLO("best128.pt"), YOLO("best416.pt")]
 
 # Define colors for different classes
 CLASS_COLORS = {
@@ -180,8 +179,6 @@ def detect_symbols(image, model, tile_size, overlap, img_path, pred):
     step = tile_size - overlap
     detections = []
     
-    device = next(model.model.parameters()).device
-    
     for y in range(0, h, step):
         for x in range(0, w, step):
             crop_detections = []
@@ -278,7 +275,7 @@ def process_image(image_path, output_dir):
     all_detections = []
     for model in models:
         for tile_size, overlap in zip(tile_sizes, overlaps):
-            pred = OBB6CHPredictor(overrides={'device': DEVICE, 'imgsz': tile_size, 'save': False})
+            pred = OBB6CHPredictor(overrides={'imgsz': tile_size, 'save': False})
             pred.setup_model(model.model)
 
             all_detections.extend(
