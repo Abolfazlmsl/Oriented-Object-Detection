@@ -29,14 +29,18 @@ TILE_SIZE = 128
 OVERLAP = 50
 NEED_CROPPING = False
 NEED_AUGMENTATION = False
+Dual_GPU = True
 
 # Training
-EPOCHS = 150
+EPOCHS = 1
 BATCH_SIZE = 32
-WORKERS = 4
+WORKERS = 2
 CACHE = False       
-RECT = False       
-DEVICE = [0,1] if torch.cuda.is_available() else "CPU"
+RECT = False  
+if Dual_GPU:     
+    DEVICE = "0,1" if torch.cuda.is_available() else "cpu"
+else:
+    DEVICE = "0" if torch.cuda.is_available() else "cpu"
 
 # Balancing
 CLASS_BALANCE_THRESHOLD = 400
@@ -59,7 +63,7 @@ VAL_LIST_CROPPED = "datasets/GeoMap/val_cropped.txt"
 
 DATA_YAML = "datasets/GeoMap/data.yaml"   
 PRETRAINED = "yolo11x-obb.pt"              
-
+    
 # ==============================
 # Helpers
 # ==============================
@@ -307,23 +311,26 @@ class MultiChannelYOLODataset(YOLODataset):
 
     def load_image(self, i: int):
         p = self.im_files[i]
-        im = cv2.imread(p, cv2.IMREAD_UNCHANGED)
+        im = cv2.imread(p, cv2.IMREAD_COLOR)  # force 3ch
         if im is None:
             raise FileNotFoundError(f"Failed to read image: {p}")
         h0, w0 = im.shape[:2]
-        six = self._ensure_six(im)
+    
+        # Build extra channels
+        L = cv2.cvtColor(im, cv2.COLOR_BGR2GRAY)
+        # CLAHE on L
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+        L_clahe = clahe.apply(L)
+        # Soft edges on L
+        edge = (soft_edge_from_L(L, method="scharr") * 255).astype(np.uint8)
+        # Denoised L
+        L_nlm = cv2.fastNlMeansDenoising(L, None, 10, 7, 21)
+    
+        six = np.dstack([im, L_clahe, edge, L_nlm])
         if not six.flags["C_CONTIGUOUS"]:
             six = np.ascontiguousarray(six)
         return six, (h0, w0), six.shape[:2]
 
-
-# ===== helpers to patch model =====
-def _replace_module(parent: nn.Module, child_name: str, new_module: nn.Module):
-    parts = child_name.split(".")
-    for p in parts[:-1]:
-        parent = getattr(parent, p)
-    setattr(parent, parts[-1], new_module)
-    
 def patch_first_conv(model: nn.Module, in_ch: int = 6) -> bool:
     for name, m in model.named_modules():
         if isinstance(m, nn.Conv2d) and m.in_channels == 3 and m.groups == 1:
@@ -366,6 +373,10 @@ def patch_first_conv(model: nn.Module, in_ch: int = 6) -> bool:
 class MultiChannelTrainer(OBBTrainer):
     """OBB trainer configured for 6-channel inputs and safe augments."""
 
+    def final_eval(self):
+        print("[INFO] Skipping post-training final_eval() to avoid post-epoch errors.")
+        return
+    
     # turn off color & multi-image augments that assume 3 channels
     def build_dataset(self, img_path, mode="train", batch=None):
         self.args.task = "obb"
@@ -405,49 +416,60 @@ class MultiChannelTrainer(OBBTrainer):
     
         ok = patch_first_conv(model, in_ch=6)
         print(">>> PATCH MAIN RESULT =", ok)
-
+        dev = torch.cuda.current_device() if torch.cuda.is_available() else "cpu"
+        print(f"[INFO] Device={dev}, RANK={os.getenv('RANK')}, LOCAL_RANK={os.getenv('LOCAL_RANK')}")
+        
         return model
+
+
+def on_fit_start_cb(trainer):
+    if getattr(trainer, "ema", None) and getattr(trainer.ema, "ema", None): 
+        try:
+            patch_first_conv(trainer.ema.ema, in_ch=6)
+        except Exception:
+            pass
         
 def on_preprocess_batch_end(trainer, batch):
     imgs = batch.get("img", None)
     if imgs is not None and imgs.dtype != torch.float32:
         batch["img"] = imgs.float()
-        
-def on_fit_start(self):
-    if hasattr(self, "ema") and hasattr(self.ema, "ema"):
-        first = next((m for m in self.ema.ema.modules() if isinstance(m, nn.Conv2d)), None)
-        if first and first.in_channels == 3:
-            ok = patch_first_conv(self.ema.ema, in_ch=6)
-            assert ok, "EMA first Conv2d not patched to 6ch"
 
-def on_fit_start_cb(trainer):
-    if getattr(trainer, "ema", None) and getattr(trainer.ema, "ema", None):
-        first = next((m for m in trainer.ema.ema.modules() if isinstance(m, nn.Conv2d)), None)
-        if first and first.in_channels == 3:
-            patch_first_conv(trainer.ema.ema, in_ch=6)
-            print("[INFO] Patched EMA first Conv2d to 6ch")
+def on_val_batch_start(*args, **kwargs):
+    if len(args) >= 3:
+        _, batch, _ = args[:3]
+    elif len(args) == 2:
+        _, batch = args
+    else:
+        batch = kwargs.get("batch")
+
+    import torch
+    if isinstance(batch, dict):
+        x = batch.get("img", None) or batch.get("imgs", None)
+        if isinstance(x, torch.Tensor) and x.ndim == 4 and x.shape[1] == 3:
+            batch["img"] = torch.cat([x, x], dim=1)[:, :6]
             
 # ==============================
 # Main
 # ==============================
 if __name__ == "__main__":
-
-    if os.getenv("RANK") is None:  
-        DEV = "0,1"  
-        if "," in DEV:  
-            nproc = len(DEV.split(","))
-            os.environ.setdefault("CUDA_VISIBLE_DEVICES", DEV)
-            os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-            os.environ.setdefault("MASTER_PORT", "29501")  
-            os.environ.setdefault("TORCH_DISTRIBUTED_DEBUG", "DETAIL")
-            os.environ.setdefault("NCCL_IB_DISABLE", "1")
-            os.environ.setdefault("NCCL_P2P_DISABLE", "1")
-            this = os.path.abspath(inspect.getfile(sys.modules[__name__]))
-            cmd = [sys.executable, "-m", "torch.distributed.run",
-                   "--nproc_per_node", str(nproc),
-                   "--master_port", os.environ["MASTER_PORT"],
-                   this]
-            raise SystemExit(subprocess.run(cmd, check=True).returncode)
+            
+    if Dual_GPU:
+        if os.getenv("RANK") is None:  
+            DEV = "0,1"  
+            if "," in DEV:  
+                nproc = len(DEV.split(","))
+                os.environ.setdefault("CUDA_VISIBLE_DEVICES", DEV)
+                os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+                os.environ.setdefault("MASTER_PORT", "29501")  
+                os.environ.setdefault("TORCH_DISTRIBUTED_DEBUG", "DETAIL")
+                os.environ.setdefault("NCCL_IB_DISABLE", "1")
+                os.environ.setdefault("NCCL_P2P_DISABLE", "1")
+                this = os.path.abspath(inspect.getfile(sys.modules[__name__]))
+                cmd = [sys.executable, "-m", "torch.distributed.run",
+                       "--nproc_per_node", str(nproc),
+                       "--master_port", os.environ["MASTER_PORT"],
+                       this]
+                raise SystemExit(subprocess.run(cmd, check=True).returncode)
             
     # 1) Tiling 
     if NEED_CROPPING:
@@ -487,7 +509,6 @@ if __name__ == "__main__":
             augmentation_repeats=AUGMENTATION_REPEATS
         )
 
-    # 3) Train with 6-channel dataset
     overrides = dict(
         model=PRETRAINED,
         data=DATA_YAML,
@@ -498,41 +519,22 @@ if __name__ == "__main__":
         cache=CACHE,
         rect=RECT,
         device=DEVICE,
-        multi_scale=True,
+        multi_scale=False,
         lr0=0.005,
         lrf=0.05,
         weight_decay=0.001,
         dropout=0.2,
         patience=10000,
-        plots=False,
+        plots=False,              
         overlap_mask=False,
         task='obb',
         mosaic=0.0, mixup=0.0, copy_paste=0.0,
-        hsv_h=0.0, hsv_s=0.0, hsv_v=0.0, amp = False
+        hsv_h=0.0, hsv_s=0.0, hsv_v=0.0,
+        amp=False
     )
-
-    is_ddp = int(os.getenv("RANK", "-1")) != -1
-    if is_ddp:
-        print("[DDP] external launcher detected (torchrun). Ultralytics will NOT respawn.")
-    trainer = MultiChannelTrainer(overrides=overrides)
-  
-    print("=== trainer.args ===")
-    try:
-     
-        print(trainer.args)
-      
-        print([k for k in dir(trainer.args) if not k.startswith("_")])
-    except Exception as e:
-        print("args-print error:", e)
     
-    for name in ("dport", "ddp_port", "master_port"):
-        if hasattr(trainer.args, name):
-            setattr(trainer.args, name, 29501)
-            print(f"[DDP] set {name}=29501")
-            break
-    else:
-        print("[DDP] WARNING: no known DDP port arg on trainer.args")
-
+    trainer = MultiChannelTrainer(overrides=overrides)
     trainer.add_callback("on_fit_start", on_fit_start_cb)
     trainer.add_callback("on_preprocess_batch_end", on_preprocess_batch_end)
+    trainer.add_callback("on_val_batch_start", on_val_batch_start)
     trainer.train()
