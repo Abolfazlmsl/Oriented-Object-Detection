@@ -27,6 +27,7 @@ import sys, subprocess, inspect
 # Tiling / dataset
 TILE_SIZE = 128
 OVERLAP = 50
+channels = 5
 NEED_CROPPING = True
 NEED_AUGMENTATION = True
 Dual_GPU = True
@@ -302,11 +303,11 @@ class MultiChannelYOLODataset(YOLODataset):
         h, w, c = img.shape
         if img.dtype != np.uint8:
             img = np.clip(img, 0, 255).astype(np.uint8)
-        if c == 6:
+        if c == channels:
             return img
-        if c > 6:
-            return img[:, :, :6]
-        pad = np.zeros((h, w, 6 - c), dtype=np.uint8)
+        if c > channels:
+            return img[:, :, :channels]
+        pad = np.zeros((h, w, channels - c), dtype=np.uint8)
         return np.concatenate([img, pad], axis=2)
 
     def load_image(self, i: int):
@@ -322,16 +323,16 @@ class MultiChannelYOLODataset(YOLODataset):
         clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
         L_clahe = clahe.apply(L)
         # Soft edges on L
-        edge = (soft_edge_from_L(L, method="scharr") * 255).astype(np.uint8)
+        # edge = (soft_edge_from_L(L, method="scharr") * 255).astype(np.uint8)
         # Denoised L
         L_nlm = cv2.fastNlMeansDenoising(L, None, 10, 7, 21)
     
-        six = np.dstack([im, L_clahe, edge, L_nlm])
+        six = np.dstack([im, L_clahe, L_nlm])
         if not six.flags["C_CONTIGUOUS"]:
             six = np.ascontiguousarray(six)
         return six, (h0, w0), six.shape[:2]
 
-def patch_first_conv(model: nn.Module, in_ch: int = 6) -> bool:
+def patch_first_conv(model: nn.Module, in_ch: int = channels) -> bool:
     for name, m in model.named_modules():
         if isinstance(m, nn.Conv2d) and m.in_channels == 3 and m.groups == 1:
             old = m
@@ -402,8 +403,8 @@ class MultiChannelTrainer(OBBTrainer):
 
     def get_model(self, cfg=None, weights=None, verbose=True):
         try:
-            model = super().get_model(cfg=cfg, weights=weights, verbose=verbose, in_channels=6)
-            print("[check] get_model accepted in_channels=6")
+            model = super().get_model(cfg=cfg, weights=weights, verbose=verbose, in_channels=channels)
+            print(f"[check] get_model accepted in_channels={channels}")
         except TypeError:
             model = super().get_model(cfg=cfg, weights=weights, verbose=verbose)
             print("[check] get_model does NOT accept in_channels; will patch Conv.")
@@ -414,7 +415,7 @@ class MultiChannelTrainer(OBBTrainer):
         except StopIteration:
             print("[check] No Conv2d found for sanity check.")
     
-        ok = patch_first_conv(model, in_ch=6)
+        ok = patch_first_conv(model, in_ch=channels)
         print(">>> PATCH MAIN RESULT =", ok)
         dev = torch.cuda.current_device() if torch.cuda.is_available() else "cpu"
         print(f"[INFO] Device={dev}, RANK={os.getenv('RANK')}, LOCAL_RANK={os.getenv('LOCAL_RANK')}")
@@ -425,7 +426,7 @@ class MultiChannelTrainer(OBBTrainer):
 def on_fit_start_cb(trainer):
     if getattr(trainer, "ema", None) and getattr(trainer.ema, "ema", None): 
         try:
-            patch_first_conv(trainer.ema.ema, in_ch=6)
+            patch_first_conv(trainer.ema.ema, in_ch=channels)
         except Exception:
             pass
         
@@ -446,7 +447,7 @@ def on_val_batch_start(*args, **kwargs):
     if isinstance(batch, dict):
         x = batch.get("img", None) or batch.get("imgs", None)
         if isinstance(x, torch.Tensor) and x.ndim == 4 and x.shape[1] == 3:
-            batch["img"] = torch.cat([x, x], dim=1)[:, :6]
+            batch["img"] = torch.cat([x, x], dim=1)[:, :channels]
             
 # ==============================
 # Main

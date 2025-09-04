@@ -24,6 +24,7 @@ overlaps = [20, 50]
 iou_thr = 0.25
 iou_threshold = 0.2
 models = [YOLO("best128.pt"), YOLO("best416.pt")]
+channels = 5
 
 # Define colors for different classes
 CLASS_COLORS = {
@@ -103,22 +104,23 @@ EXCLUDED_CLASSES = {} if calculate_metrics else {12, 13}
 
 all_dets_per_image = {}  
     
-def to_6ch_from_bgr(img_bgr):
+def to_multich_from_bgr(img_bgr):
     bgr = img_bgr  # keep BGR to match training
     L = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
 
     clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))  # match training
     L_clahe = clahe.apply(L)
 
-    gx = cv2.Scharr(L, cv2.CV_32F, 1, 0)
-    gy = cv2.Scharr(L, cv2.CV_32F, 0, 1)
-    edge = cv2.magnitude(gx, gy)
-    edge = cv2.normalize(edge, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    # gx = cv2.Scharr(L, cv2.CV_32F, 1, 0)
+    # gy = cv2.Scharr(L, cv2.CV_32F, 0, 1)
+    # edge = cv2.magnitude(gx, gy)
+    # edge = cv2.normalize(edge, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
 
     L_dn = cv2.fastNlMeansDenoising(L, None, h=10, templateWindowSize=7, searchWindowSize=21)
 
-    six = np.dstack([bgr, L_clahe, edge, L_dn])  # [B,G,R,Lclahe,EDGE,Ldn]
-    return six
+    # six = np.dstack([bgr, L_clahe, edge, L_dn])  # [B,G,R,Lclahe,EDGE,Ldn]
+    multich = np.dstack([bgr, L_clahe, L_dn])
+    return multich
 
 
 def compute_angle_from_bbox(points):
@@ -186,7 +188,7 @@ def detect_symbols(image, model, tile_size, overlap, img_path, pred):
             if crop.shape[0] != tile_size or crop.shape[1] != tile_size:
                 continue
             
-            six = to_6ch_from_bgr(crop)                                  # H×W×6
+            six = to_multich_from_bgr(crop)                                  # H×W×6
             tensor = torch.from_numpy(six).permute(2, 0, 1).float()  # 6×H×W
             tensor = (tensor / 255.0).unsqueeze(0)                   # 1x6xHxW
             
@@ -275,7 +277,7 @@ def process_image(image_path, output_dir):
     all_detections = []
     for model in models:
         for tile_size, overlap in zip(tile_sizes, overlaps):
-            pred = OBB6CHPredictor(overrides={'imgsz': tile_size, 'save': False})
+            pred = OBBMultiCHPredictor(overrides={'imgsz': tile_size, 'save': False})
             pred.setup_model(model.model)
 
             all_detections.extend(
@@ -482,7 +484,7 @@ def run_fusion_eval(input_dir, iou_thr=0.5):
     print(f"[Fusion @ {best['thr']:.2f}] Precision={P:.3f} | Recall={R:.3f} | F1={F1:.3f}")
     _classwise_report(all_images, conf_thr=best['thr'], iou_thr=iou_thr)
 
-class OBB6CHPredictor(OBBPredictor):
+class OBBMultiCHPredictor(OBBPredictor):
     def setup_model(self, model):
         self.model = model
         if hasattr(self, "args"):
@@ -512,14 +514,14 @@ class OBB6CHPredictor(OBBPredictor):
     def preprocess(self, im):
         import torch
         if isinstance(im, torch.Tensor):
-            if im.ndim == 4 and im.shape[1] == 6:
+            if im.ndim == 4 and im.shape[1] == channels:
                 return im.to(self.device, non_blocking=True).float().contiguous()
-            if im.ndim == 3 and im.shape[0] == 6:
+            if im.ndim == 3 and im.shape[0] == channels:
                 im = im.unsqueeze(0)
                 return im.to(self.device, non_blocking=True).float().contiguous()
         if isinstance(im, (list, tuple)) and len(im) > 0:
             t0 = im[0]
-            if isinstance(t0, torch.Tensor) and t0.ndim == 3 and t0.shape[0] == 6:
+            if isinstance(t0, torch.Tensor) and t0.ndim == 3 and t0.shape[0] == channels:
                 im = torch.stack(im, 0)
                 return im.to(self.device, non_blocking=True).float().contiguous()
         return super().preprocess(im)
