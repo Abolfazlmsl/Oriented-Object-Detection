@@ -8,6 +8,7 @@ yolo11n.pt
 datasets/GeoMap/images/train/*
 datasets/GeoMap/images/val/*
 datasets/GeoMap/cropped/
+datasets/GeoMap/cropped6/
 /datasets/GeoMap/val_cropped.txt
 /datasets/GeoMap/train_cropped.txt
 mmdata

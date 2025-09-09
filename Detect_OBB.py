@@ -19,7 +19,6 @@ start_time = time.time()
 calculate_metrics = True
 tile_sizes = [128, 416]
 overlaps = [20, 50]
-iou_thr = 0.25
 iou_threshold = 0.2
 models = [YOLO("best128.pt"), YOLO("best416.pt")]
 
@@ -453,6 +452,6 @@ print("--- %s seconds ---" % (time.time() - start_time))
 
 if calculate_metrics:
     try:
-        run_fusion_eval(input_dir, iou_thr=iou_thr)
+        run_fusion_eval(input_dir, iou_thr=iou_threshold)
     except Exception as e:
         print(f"[Eval] Skipped due to error: {e}")

@@ -1,50 +1,56 @@
-#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Created on Tue Feb  4 13:55:54 2025
+Created on Sat Sep  6 13:14:46 2025
+
+Multi-channel OBB Detection (6 channels)
 
 @author: amoslemi
 """
 
-import cv2
 import os
-from ultralytics import YOLO
+import cv2
+import time
 import numpy as np
 import pandas as pd
-from shapely.geometry import Polygon
-from ultralytics.models.yolo.obb import OBBPredictor
 import torch
-import time
+from ultralytics import YOLO
+from shapely.geometry import Polygon
+from ultralytics.models.yolo.obb.predict import OBBPredictor
 
-start_time = time.time()
-
+# =========================
+# Config
+# =========================
+channels = 6         # set to 3, 4, 5, or 6
 calculate_metrics = True
 tile_sizes = [128, 416]
 overlaps = [20, 50]
-iou_thr = 0.25
 iou_threshold = 0.2
 models = [YOLO("best128.pt"), YOLO("best416.pt")]
-channels = 5
 
-# Define colors for different classes
+USM_RADIUS = 7.0    
+USM_WEIGHT = 1.40   
+NLM_H      = 7
+NLM_T      = 7
+NLM_S      = 21
+
+# Classes/colors/names
 CLASS_COLORS = {
-    0: (255, 0, 0),  # Landslide
-    1: (0, 255, 0),  # Strike
-    2: (0, 0, 255),  # Spring
+    0: (255, 0, 0),    # Landslide
+    1: (0, 255, 0),    # Strike
+    2: (0, 0, 255),    # Spring
     3: (255, 255, 0),  # Minepit
     4: (255, 0, 255),  # Hillside
     5: (0, 255, 255),  # Feuchte
-    6: (0, 0, 0),  # Torf
-    7: (240, 34, 0),  # Bergsturz
-    8: (50, 20, 60), # Landslide 2  
-    9: (60, 50, 20), # Spring 2  
-    10: (200, 150, 80), # Spring 3  
-    11: (100, 200, 150), # Minepit 2 
-    12: (12, 52, 83), # Spring B2
-    13: (123, 232, 23), # Spring B2 
+    6: (0, 0, 0),      # Torf
+    7: (240, 34, 0),   # Bergsturz
+    8: (50, 20, 60),   # Landslide 2
+    9: (60, 50, 20),   # Spring 2
+    10: (200, 150, 80),# Spring 3
+    11: (100, 200, 150),# Minepit 2
+    12: (12, 52, 83),  # Spring B2
+    13: (123, 232, 23) # Hillside B2
 }
 
-# Define class names
 CLASS_NAMES = {
     0: "Landslide 1",
     1: "Strike",
@@ -62,25 +68,9 @@ CLASS_NAMES = {
     13: "Hillside B2",
 }
 
-
-# Add threshold for each class
 if calculate_metrics:
-    CLASS_THRESHOLDS = {
-        0: 0.0,  # Landslide 1
-        1: 0.0,  # Strike
-        2: 0.0,  # Spring 1
-        3: 0.0,  # Minepit 1
-        4: 0.0,  # Hillside
-        5: 0.0,  # Feuchte
-        6: 0.0,  # Torf
-        7: 0.0,  # Bergsturz
-        8: 0.0,  # Landslide 2
-        9: 0.0,  # Spring 2
-        10: 0.0,  # Spring 3
-        11: 0.0,  # Minepit 2
-        12: 0.0,  # Spring B2
-        13: 0.0,  # Hillside B2
-    }
+    CLASS_THRESHOLDS = {cid: 0.0 for cid in CLASS_NAMES.keys()}
+    EXCLUDED_CLASSES = {}
 else:
     CLASS_THRESHOLDS = {
         0: 0.6,  # Landslide 1
@@ -98,249 +88,296 @@ else:
         12: 0.05,  # Spring B2
         13: 0.05,  # Hillside B2
     }
+    EXCLUDED_CLASSES = {12, 13}
+
+all_dets_per_image = {}
+start_time = time.time()
+
+# =========================
+# Extra channel builders
+# =========================
+
+def _unsharp_imagej(bgr_img, radius=USM_RADIUS, weight=USM_WEIGHT, border=cv2.BORDER_REFLECT_101):
+    lab32 = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2LAB).astype(np.float32)
+    L, A, B = cv2.split(lab32)
+    L_blur  = cv2.GaussianBlur(L, (0, 0), sigmaX=radius, sigmaY=radius, borderType=border)
+    L_sharp = np.clip(L + weight * (L - L_blur), 0, 255)
+    lab_s   = cv2.merge([L_sharp, A, B]).astype(np.uint8)
+    return cv2.cvtColor(lab_s, cv2.COLOR_LAB2BGR)
+
+def _nlm_rgb_to_rgb(bgr_img, h=NLM_H, t=NLM_T, s=NLM_S):
+    rgb = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2RGB)
+    rgb_d = np.empty_like(rgb)
+    for c in range(3):
+        rgb_d[:,:,c] = cv2.fastNlMeansDenoising(rgb[:,:,c], None, h=h, templateWindowSize=t, searchWindowSize=s)
+    return rgb_d  # uint8 RGB
+
+
+def letterbox_ultra(img, new_shape=640, color=(114, 114, 114), stride=32, auto=True, scaleFill=False, scaleup=True):
+    """
+    Returns:
+      lb_img, ratio(tuple), dwdh(tuple)
+    """
+    h, w = img.shape[:2]
+    if isinstance(new_shape, int):
+        new_shape = (new_shape, new_shape)
+
+    # make padding color match channel count
+    C = 1 if img.ndim == 2 else img.shape[2]
+    if isinstance(color, tuple) and len(color) != C:
+        color = tuple([114] * C)
+
+    r = min(new_shape[0] / h, new_shape[1] / w)
+    if not scaleup:
+        r = min(r, 1.0)
+
+    new_unpad = (int(round(w * r)), int(round(h * r)))
+    dw, dh = new_shape[1] - new_unpad[0], new_shape[0] - new_unpad[1]
+    if auto:
+        dw, dh = np.mod(dw, stride), np.mod(dh, stride)
+    dw /= 2; dh /= 2
+
+    if (w, h) != new_unpad:
+        img = cv2.resize(img, new_unpad, interpolation=cv2.INTER_LINEAR)
+
+    top, bottom = int(round(dh - 0.1)), int(round(dh + 0.1))
+    left, right = int(round(dw - 0.1)), int(round(dw + 0.1))
+    if not np.isscalar(color) and img.ndim == 3 and img.shape[2] > 4:
+        color = 114
+    img = cv2.copyMakeBorder(img, top, bottom, left, right,
+                             cv2.BORDER_CONSTANT, value=color)
+    return img, (r, r), (dw, dh)
+
+def ensure_predictor(model, imgsz):
+    """
+    Create a predictor only to reuse Ultralytics postprocess/NMS.
+    """
+    if getattr(model, "predictor", None) is not None:
+        return model.predictor
+    pred = OBBPredictor(overrides={"imgsz": imgsz, "conf": 0.25})
+    pred.setup_model(model.model)
+    # neutralize warmup flags to avoid 3ch warmup:
+    if not hasattr(model.model, "warmup"):
+        model.model.warmup = lambda *a, **k: None
+    if not hasattr(model.model, "pt"):
+        model.model.pt = True
+    if not hasattr(model.model, "triton"):
+        model.model.triton = False
+    model.predictor = pred
+    return pred
+
+def run_inference_on_crop(crop_bgr, model, imgsz):
+    """
+    Unified path for 6 channels:
+      build_multich -> letterbox -> tensor -> model.model() -> predictor.postprocess()
+    Returns: list[Results] (Ultralytics)
+    """
+    # build multi-channel (even if CHANNELS==3 returns BGR)
+    multi = build_multich(crop_bgr, out_channels=channels)  # HxWxC
+
+    # letterbox like Ultralytics
+    stride = int(getattr(model.model, "stride", torch.tensor([32])).max().item())
+    lb_img, _, _ = letterbox_ultra(multi, new_shape=imgsz, color=114, auto=True, stride=stride)
+
+    # to tensor (NCHW, float/255)
+    im = torch.from_numpy(lb_img).permute(2, 0, 1).unsqueeze(0).contiguous().float() / 255.0
+    device = next(model.model.parameters()).device
+    dtype  = next(model.model.parameters()).dtype  
     
-# Classes to exclude completely (will not be shown on the image)
-EXCLUDED_CLASSES = {} if calculate_metrics else {12, 13}
-
-all_dets_per_image = {}  
+    # if im.shape[1] >= 3:
+    #     rgb3 = im[:, [2, 1, 0], :, :]  
+    #     if im.shape[1] == 3:
+    #         im = rgb3
+    #     else:
+    #         # im = torch.cat([rgb3, im[:, 3:, :, :]], dim=1)  
+    #         pass
     
-def to_multich_from_bgr(img_bgr):
-    bgr = img_bgr  # keep BGR to match training
-    L = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    im = im.to(device, non_blocking=True).type(dtype)
 
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))  # match training
-    L_clahe = clahe.apply(L)
+    # forward (no extra preprocess)
+    with torch.no_grad():
+        raw = model.model(im)
 
-    # gx = cv2.Scharr(L, cv2.CV_32F, 1, 0)
-    # gy = cv2.Scharr(L, cv2.CV_32F, 0, 1)
-    # edge = cv2.magnitude(gx, gy)
-    # edge = cv2.normalize(edge, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    # make list preds and ensure predictor
+    preds = raw if isinstance(raw, (list, tuple)) else [raw]
+    predictor = ensure_predictor(model, imgsz)
 
-    L_dn = cv2.fastNlMeansDenoising(L, None, h=10, templateWindowSize=7, searchWindowSize=21)
+    # predictor.batch[0] is used in construct_results; provide a dummy list of paths
+    predictor.batch = (['in_memory'] * len(preds), None, None, None)
 
-    # six = np.dstack([bgr, L_clahe, edge, L_dn])  # [B,G,R,Lclahe,EDGE,Ldn]
-    multich = np.dstack([bgr, L_clahe, L_dn])
-    return multich
+    # IMPORTANT: pass orig_imgs as BGR crop (not multi) to keep scaling identical to baseline
+    results = predictor.postprocess(preds, im, [crop_bgr])
+    return results
+
+def build_multich(bgr: np.ndarray, out_channels: int = channels) -> np.ndarray:
+    """
+    Build multi-channel per-crop exactly like training:
+      6ch = [RGB_raw, RGB_proc] where RGB_proc = Unsharp(L in LAB) -> NLM(RGB).
+    If out_channels == 3: returns only RGB_raw (for 3ch models).
+    """
+    # RGB raw
+    rgb_raw = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+
+    # Unsharp on L in LAB (ImageJ-like), then NLM on each RGB channel
+    bgr_usm  = _unsharp_imagej(bgr, radius=USM_RADIUS, weight=USM_WEIGHT)
+    rgb_proc = _nlm_rgb_to_rgb(bgr_usm, h=NLM_H, t=NLM_T, s=NLM_S)  # uint8 RGB
+
+    if out_channels == 3:
+        multich = rgb_raw
+    elif out_channels == 6:
+        multich = np.dstack([rgb_raw, rgb_proc]).astype(np.uint8)  # (H,W,6)
+    else:
+        raise ValueError(f"Unsupported out_channels={out_channels}. Use 3 or 6.")
+
+    return np.ascontiguousarray(multich)
+
+    # if channels > 3:
+    #     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    #     L_nlm = cv2.fastNlMeansDenoising(gray, None, 10, 7, 21)
+    #     clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    #     L_clahe = clahe.apply(gray)
+    #     gx = cv2.Scharr(gray, cv2.CV_32F, 1, 0)
+    #     gy = cv2.Scharr(gray, cv2.CV_32F, 0, 1)
+    #     mag = np.abs(gx) + np.abs(gy)
+    #     edge = (255.0 * (mag / (mag.max() + 1e-6))).astype(np.uint8)
+
+    # if channels == 4:
+    #     layers.append(L_nlm[..., None])
+
+    # elif channels == 5:
+    #     layers.append(L_clahe[..., None])
+    #     layers.append(L_nlm[..., None])
+
+    # elif channels == 6:
+    #     layers.append(L_clahe[..., None])
+    #     layers.append(edge[..., None])
+    #     layers.append(L_nlm[..., None])
+
+    # multich = np.dstack(layers)
+    
+    # multich = np.dstack([rgb_raw, rgb_proc]).astype(np.uint8)
+    # return np.ascontiguousarray(multich)
 
 
+# =========================
+# Utils
+# =========================
 def compute_angle_from_bbox(points):
-    """
-    Compute the orientation angle of a bounding box given its four corner points.
-    """
     x1, y1, x2, y2, x3, y3, x4, y4 = points
     angle = np.arctan2(x4 - x1, y4 - y1) * (180.0 / np.pi)
-    
     if angle > 0:
         angle = 180 - angle
     else:
-        angle = np.abs(angle)
-        
+        angle = abs(angle)
     return angle
 
-
-def convert_bgr_to_rgb(image):
-    """
-    Convert an image to grayscale and return a 3-channel grayscale image.
-
-    Parameters:
-    image (np.ndarray): Input color image.
-
-    Returns:
-    np.ndarray: 3-channel grayscale image.
-    """
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    gray = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
-    # gray = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    return gray
-
 def compute_polygon_iou(box1, box2):
-    """
-    Compute IoU between two rotated bounding boxes.
-    
-    Parameters:
-    box1, box2: Lists containing 8 coordinates (x1, y1, x2, y2, x3, y3, x4, y4).
-
-    Returns:
-    float: IoU score.
-    """
     poly1 = Polygon([(box1[i], box1[i+1]) for i in range(0, 8, 2)])
     poly2 = Polygon([(box2[i], box2[i+1]) for i in range(0, 8, 2)])
-
     if not poly1.is_valid or not poly2.is_valid:
-        return 0.0 
+        return 0.0
+    inter = poly1.intersection(poly2).area
+    union = poly1.area + poly2.area - inter
+    return inter / union if union > 0 else 0.0
 
-    intersection = poly1.intersection(poly2).area
-    union = poly1.area + poly2.area - intersection
-    return intersection / union if union > 0 else 0.0
+def merge_detections(detections, iou_thr=0.5, excluse_check=True):
+    if not detections:
+        return []
+    detections.sort(key=lambda x: x[9], reverse=True)
+    merged = []
+    excluded_boxes = [det[:11] for det in detections if det[8] in EXCLUDED_CLASSES]
 
-def detect_symbols(image, model, tile_size, overlap, img_path, pred):
-    """
-    Detect objects in an image using a given model, tile size, and overlap.
-    """
+    for det1 in detections:
+        box1, cls1, conf1 = det1[:8], det1[8], det1[9]
+        if cls1 in EXCLUDED_CLASSES:
+            continue
+        keep = True
+
+        if excluse_check:
+            for det_excl in excluded_boxes:
+                excl_box, excl_cls, excl_conf = det_excl[:8], det_excl[8], det_excl[9]
+                iou = compute_polygon_iou(box1, excl_box)
+                if iou > 0.3:
+                    if conf1 > 0.85 or excl_conf < 0.5:
+                        continue
+                    else:
+                        keep = False
+                        break
+
+        for det2 in merged:
+            box2, cls2 = det2[:8], det2[8]
+            if cls1 == cls2 and compute_polygon_iou(box1, box2) >= iou_thr:
+                keep = False
+                break
+
+        if keep:
+            merged.append(det1)
+
+    return merged
+
+# =========================
+# Detection
+# =========================
+def detect_symbols(image, model, tile_size, overlap):
     h, w, _ = image.shape
     step = tile_size - overlap
     detections = []
-    
+
     for y in range(0, h, step):
         for x in range(0, w, step):
             crop_detections = []
-            crop = image[y:y + tile_size, x:x + tile_size]
+            crop = image[y:y+tile_size, x:x+tile_size]
             if crop.shape[0] != tile_size or crop.shape[1] != tile_size:
                 continue
-            
-            six = to_multich_from_bgr(crop)                                  # H×W×6
-            tensor = torch.from_numpy(six).permute(2, 0, 1).float()  # 6×H×W
-            tensor = (tensor / 255.0).unsqueeze(0)                   # 1x6xHxW
-            
-            print("Tensor shape for model:", tensor.shape)
-            
-            with torch.no_grad():
-                results = pred(source=tensor, stream=False)
                 
+            results = run_inference_on_crop(crop, model, imgsz=tile_size)
+
             for box in results[0].obb:
-                points = [int(x) for x in box.xyxyxyxy[0].flatten().tolist()]
+                points = [int(v) for v in box.xyxyxyxy[0].flatten().tolist()]
                 x1, y1, x2, y2, x3, y3, x4, y4 = points
                 cls = int(box.cls[0])
                 conf = float(box.conf[0])
                 if conf < CLASS_THRESHOLDS.get(cls, 0.05):
                     continue
-                
-                if CLASS_NAMES.get(cls, f"Class{cls}") == "Strike": 
-                    angle = compute_angle_from_bbox(points)
-                else:
-                    angle = 0
-                crop_detections.append((x1 + x, y1 + y, x2 + x, y2 + y, x3 + x, y3 + y,\
-                                        x4 + x, y4 + y, cls, conf, angle))
+                angle = compute_angle_from_bbox(points) if CLASS_NAMES.get(cls) == "Strike" else 0
+                crop_detections.append((x1+x, y1+y, x2+x, y2+y, x3+x, y3+y, x4+x, y4+y, cls, conf, angle))
+            
             detections.extend(merge_detections(crop_detections, iou_threshold))
-                    
+            
     return detections
 
-def merge_detections(detections, iou_threshold=0.5, excluse_check=True):
-    """
-    Merge overlapping detections while considering confidence and class types.
-    
-    Parameters:
-    detections (list): List of detected bounding boxes (x1, y1, ..., x4, y4, class, confidence).
-    iou_threshold (float): IoU threshold for merging overlapping detections.
-
-    Returns:
-    list: Filtered list of detections.
-    """
-    
-    if not detections:
-        return []
-    
-    detections.sort(key=lambda x: x[9], reverse=True)  
-    merged = []
-    excluded_boxes = [det[:11] for det in detections if det[8] in EXCLUDED_CLASSES]
-    
-    for det1 in detections:
-        box1, cls1, conf1 = det1[:8], det1[8], det1[9]
-        if cls1 in EXCLUDED_CLASSES:
-            continue 
-        
-        # poly1 = Polygon([(box1[i], box1[i+1]) for i in range(0, 8, 2)])
-        keep = True
-
-        if excluse_check:
-            for det_excl in excluded_boxes:
-               excl_box, excl_cls, excl_conf = det_excl[:8], det_excl[8], det_excl[9]
-               # poly_excl = Polygon([(excl_box[i], excl_box[i+1]) for i in range(0, 8, 2)])
-               iou = compute_polygon_iou(box1, excl_box)
-               
-               if iou > 0.3:
-                   if conf1 > 0.85 or excl_conf < 0.5:
-                       continue  
-                   else:
-                       keep = False  
-                       break
-        
-        for det2 in merged:
-            box2, cls2 = det2[:8], det2[8]
-            # poly2 = Polygon([(box2[i], box2[i+1]) for i in range(0, 8, 2)])
-            
-            if cls1 == cls2 and compute_polygon_iou(box1, box2) >= iou_threshold:
-                keep = False  
-                break
-
-        if keep:
-            merged.append(det1)
-    
-    return merged
-
-
 def process_image(image_path, output_dir):
-    """
-    Process an image by applying object detection at multiple tile sizes and merging the results.
-    """
     image = cv2.imread(image_path, cv2.IMREAD_COLOR)
     all_detections = []
-    for model in models:
-        for tile_size, overlap in zip(tile_sizes, overlaps):
-            pred = OBBMultiCHPredictor(overrides={'imgsz': tile_size, 'save': False})
-            pred.setup_model(model.model)
+    for tile_size, overlap, model in zip(tile_sizes, overlaps, models):
+        all_detections.extend(detect_symbols(image, model, tile_size, overlap))
 
-            all_detections.extend(
-                detect_symbols(
-                    image=image,
-                    model=model,
-                    tile_size=tile_size,
-                    overlap=overlap,
-                    img_path=os.path.join(input_dir, image_file),
-                    pred=pred
-                )
-            )
-            
-    print("--- %s seconds ---" % (time.time() - start_time))
-    
+    print(f"--- {time.time() - start_time:.2f} seconds ---")
+
     merged_detections = merge_detections(all_detections, iou_threshold, False)
     result_image = image.copy()
     image_name = os.path.basename(image_path)
     excel_path = os.path.join(output_dir, image_name.replace(".jpg", ".xlsx").replace(".png", ".xlsx"))
-    
+
     data = []
     for x1, y1, x2, y2, x3, y3, x4, y4, cls, conf, angle in merged_detections:
         if cls in EXCLUDED_CLASSES:
-            continue  
-        
+            continue
         color = CLASS_COLORS.get(cls, (0, 255, 255))
         label = CLASS_NAMES.get(cls, f"Class{cls}")
-        
-        # Draw polygon
-        points = np.array([[x1, y1], [x2, y2], [x3, y3], [x4, y4]], np.int32)
-        cv2.polylines(result_image, [points], isClosed=True, color=color, thickness=2)
-        
-        # Place label text above the box
-        text_x = min(x1, x2, x3, x4)
-        text_y = min(y1, y2, y3, y4) - 10  # Shift text above the box
-        cv2.putText(result_image, f"{label} {conf:.2f}", (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-        
-        # Draw polygon
-        # points = np.array([[x1, y1], [x2, y2], [x3, y3], [x4, y4]], np.int32)
-        # cv2.polylines(result_image, [points], isClosed=True, color=color, thickness=2)
-        
-        # # Annotate corners with numbers 1 to 4
-        # corner_coords = [(x1, y1), (x2, y2), (x3, y3), (x4, y4)]
-        # for idx, (px, py) in enumerate(corner_coords, start=1):
-        #     cv2.putText(result_image, str(idx), (px + 3, py - 3), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
-        #     cv2.putText(result_image, str(idx), (px + 3, py - 3), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        
-        # # Place label text above the topmost y-coordinate of the box
-        # text_x = min(x1, x2, x3, x4)
-        # text_y = min(y1, y2, y3, y4) - 15  # Shift text above the corner numbers
-        # cv2.putText(result_image, f"{label} {conf:.2f}", (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+        pts = np.array([[x1,y1],[x2,y2],[x3,y3],[x4,y4]], np.int32)
+        cv2.polylines(result_image, [pts], isClosed=True, color=color, thickness=2)
+        tx, ty = min(x1,x2,x3,x4), min(y1,y2,y3,y4)-10
+        cv2.putText(result_image, f"{label} {conf:.2f}", (tx,ty),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+        data.append([label, x1,y1,x2,y2,x3,y3,x4,y4,conf,angle])
 
+    out_path = os.path.join(output_dir, image_name.replace(".jpg","_detected.jpg").replace(".png","_detected.jpg"))
+    cv2.imwrite(out_path, result_image)
 
-        data.append([label, x1, y1, x2, y2, x3, y3, x4, y4, conf, angle])
-    
-    output_path = os.path.join(output_dir, os.path.basename(image_path).replace(".jpg", "_detected.jpg").replace(".png", "_detected.jpg"))
-    if result_image.ndim == 3 and result_image.shape[2] > 3:
-        result_image = result_image[:, :, :3]
-    cv2.imwrite(output_path, result_image)
-    
-    df = pd.DataFrame(data, columns=["Class", "X1", "Y1", "X2", "Y2", "X3", "Y3", "X4", "Y4", "Confidence", "Angle"])
+    df = pd.DataFrame(data, columns=["Class","X1","Y1","X2","Y2","X3","Y3","X4","Y4","Confidence","Angle"])
     df.to_excel(excel_path, index=False)
-    
+
     all_dets_per_image[image_path] = merged_detections
 
 def _label_path_for_image(image_path):
@@ -483,63 +520,24 @@ def run_fusion_eval(input_dir, iou_thr=0.5):
     P, R, F1 = _evaluate_dataset(all_images, conf_thr=best['thr'], iou_thr=iou_thr)
     print(f"[Fusion @ {best['thr']:.2f}] Precision={P:.3f} | Recall={R:.3f} | F1={F1:.3f}")
     _classwise_report(all_images, conf_thr=best['thr'], iou_thr=iou_thr)
-
-class OBBMultiCHPredictor(OBBPredictor):
-    def setup_model(self, model):
-        self.model = model
-        if hasattr(self, "args"):
-            setattr(self.args, "save", False)
-        orig_predict = getattr(self.model, 'predict', None)
-        if callable(orig_predict):
-            def _predict_no_verbose(*args, **kwargs):
-                kwargs.pop('verbose', None)   
-                return orig_predict(*args, **kwargs)
-            self.model.predict = _predict_no_verbose
-        self.device = next(self.model.parameters()).device
-        self.model.eval()
-
-        if not hasattr(self.model, "pt"):
-            self.model.pt = True         
-        if not hasattr(self.model, "triton"):
-            self.model.triton = False    
-        if not hasattr(self.model, "warmup"):
-            self.model.warmup = lambda *a, **k: None 
-
-        if hasattr(self, "args") and getattr(self.args, "half", False):
-            try:
-                self.model.half()
-            except Exception:
-                pass
-
-    def preprocess(self, im):
-        import torch
-        if isinstance(im, torch.Tensor):
-            if im.ndim == 4 and im.shape[1] == channels:
-                return im.to(self.device, non_blocking=True).float().contiguous()
-            if im.ndim == 3 and im.shape[0] == channels:
-                im = im.unsqueeze(0)
-                return im.to(self.device, non_blocking=True).float().contiguous()
-        if isinstance(im, (list, tuple)) and len(im) > 0:
-            t0 = im[0]
-            if isinstance(t0, torch.Tensor) and t0.ndim == 3 and t0.shape[0] == channels:
-                im = torch.stack(im, 0)
-                return im.to(self.device, non_blocking=True).float().contiguous()
-        return super().preprocess(im)
-
+    
+# =========================
+# Main
+# =========================
 input_dir = "Input"
 output_dir = "Output"
 os.makedirs(output_dir, exist_ok=True)
 
-for image_file in os.listdir(input_dir):
-    if image_file.lower().endswith((".png", ".jpg", ".jpeg")):
-        print(f"Processing {image_file}...")
-        process_image(os.path.join(input_dir, image_file), output_dir)
-        print(f"Results saved for {image_file}")
+for fname in os.listdir(input_dir):
+    if fname.lower().endswith((".jpg",".png",".jpeg",".tif",".tiff")):
+        print(f"Processing {fname}...")
+        process_image(os.path.join(input_dir,fname), output_dir)
+        print(f"Results saved for {fname}")
 
-print("--- %s seconds ---" % (time.time() - start_time))
+print(f"--- {time.time() - start_time:.2f} seconds ---")
 
 if calculate_metrics:
     try:
-        run_fusion_eval(input_dir, iou_thr=iou_thr)
+        run_fusion_eval(input_dir, iou_thr=iou_threshold)
     except Exception as e:
         print(f"[Eval] Skipped due to error: {e}")

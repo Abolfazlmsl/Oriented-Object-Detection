@@ -3,9 +3,6 @@
 Created on Sun Aug 24 18:29:09 2025
 
 6-Channel YOLO11-OBB training:
-- Tile into crops + OBB label adjust
-- Build 6ch per-tile at load time: [R,G,B,L_CLAHE,edge_soft,L_NLM]
-- Patch first Conv to in_channels=6 and train
 
 @author: amoslemi
 """
@@ -16,10 +13,10 @@ import random
 import numpy as np
 import pandas as pd
 import torch
-import torch.nn as nn
-from ultralytics.data.dataset import YOLODataset
-from ultralytics.models.yolo.obb import OBBTrainer
-import sys, subprocess, inspect
+from ultralytics import YOLO
+import shutil
+from pathlib import Path
+from tqdm import tqdm
 
 # ==============================
 # Config
@@ -27,9 +24,10 @@ import sys, subprocess, inspect
 # Tiling / dataset
 TILE_SIZE = 128
 OVERLAP = 50
-channels = 5
+channels = 6
 NEED_CROPPING = True
 NEED_AUGMENTATION = True
+NEED_6CHANNEL = True
 Dual_GPU = True
 
 # Training
@@ -62,9 +60,24 @@ VAL_OUT_LBL_DIR = "datasets/GeoMap/cropped/labels/val"
 VAL_LIST = "datasets/GeoMap/val.txt"
 VAL_LIST_CROPPED = "datasets/GeoMap/val_cropped.txt"
 
-DATA_YAML = "datasets/GeoMap/data.yaml"   
+TRAIN_OUT_IMG6_DIR = "datasets/GeoMap/cropped6/images/train"
+VAL_OUT_IMG6_DIR   = "datasets/GeoMap/cropped6/images/val"
+
+TRAIN_OUT_LBL6_DIR = "datasets/GeoMap/cropped6/labels/train"
+VAL_OUT_LBL6_DIR   = "datasets/GeoMap/cropped6/labels/val"
+
+TRAIN_LIST_6CH = "datasets/GeoMap/train_cropped_6ch.txt"
+VAL_LIST_6CH   = "datasets/GeoMap/val_cropped_6ch.txt"
+
+DATA_YAML = "datasets/GeoMap/data6ch.yaml"   
 PRETRAINED = "yolo11x-obb.pt"              
     
+USM_RADIUS = 7.0     
+USM_WEIGHT = 1.40 
+NLM_H = 7
+NLM_T = 7
+NLM_S = 21
+
 # ==============================
 # Helpers
 # ==============================
@@ -79,7 +92,48 @@ def append_list(txt_file, paths):
         for p in paths:
             f.write(p + "\n")
 
+def build_six_from_bgr(bgr: np.ndarray,
+                       usm_radius: float = USM_RADIUS,
+                       usm_weight: float = USM_WEIGHT,
+                       nlm_h: int = NLM_H, nlm_t: int = NLM_T, nlm_s: int = NLM_S) -> np.ndarray:
+    """Return HxWx6 uint8 = [RGB_raw, RGB_proc] where RGB_proc = Unsharp(L) -> NLM(RGB)."""
+    # RGB raw
+    rgb_raw = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
+    # Unsharp (ImageJ-like) on L in LAB
+    lab32 = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+    L, A, B = cv2.split(lab32)
+    Lb = cv2.GaussianBlur(L, (0, 0), sigmaX=usm_radius, sigmaY=usm_radius, borderType=cv2.BORDER_REFLECT_101)
+    Ls = np.clip(L + usm_weight * (L - Lb), 0, 255)
+    bgr_usm = cv2.cvtColor(np.dstack([Ls, A, B]).astype(np.uint8), cv2.COLOR_LAB2BGR)
+
+    # NLM per RGB channel
+    rgb = cv2.cvtColor(bgr_usm, cv2.COLOR_BGR2RGB)
+    rgb_proc = np.empty_like(rgb)
+    for c in range(3):
+        rgb_proc[..., c] = cv2.fastNlMeansDenoising(rgb[..., c], None,
+                                                    h=nlm_h, templateWindowSize=nlm_t, searchWindowSize=nlm_s)
+
+    six = np.dstack([rgb_raw, rgb_proc]).astype(np.uint8)  # (H,W,6)
+    return np.ascontiguousarray(six)
+    
+def mirror_labels_for_6ch(image6_paths: list, src_lbl_dir: str, dst_lbl_dir: str):
+    """
+    Copy label TXT files from cropped/labels/ to cropped6/labels/
+    """
+    os.makedirs(dst_lbl_dir, exist_ok=True)
+    copied, missing = 0, 0
+    for ip in image6_paths:
+        stem = Path(ip).stem              # e.g., "xxx_tile_123"
+        src = os.path.join(src_lbl_dir, f"{stem}.txt")
+        dst = os.path.join(dst_lbl_dir, f"{stem}.txt")
+        if os.path.exists(src):
+            shutil.copy2(src, dst)
+            copied += 1
+        else:
+            missing += 1
+            print(f"[WARN] Label not found for {stem}: {src}")
+    print(f"[INFO] Mirrored labels: {copied}, missing: {missing} → {dst_lbl_dir}")
 # ==============================
 # Tiling + OBB label adjust 
 # ==============================
@@ -258,204 +312,105 @@ def balance_classes(image_dir, label_dir, list_file, class_balance_threshold=100
             counts[cid] = counts.get(cid, 0) + 1
     print(f"[INFO] Balanced class distribution: {counts}")
 
+def unsharp_L_on_BGR(bgr: np.ndarray, radius: float = USM_RADIUS, weight: float = USM_WEIGHT) -> np.ndarray:
+    """ImageJ-like Unsharp on L channel (LAB), returns BGR uint8."""
+    lab32 = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+    L, A, B = cv2.split(lab32)
+    Lb = cv2.GaussianBlur(L, (0, 0), sigmaX=radius, sigmaY=radius, borderType=cv2.BORDER_REFLECT_101)
+    Ls = np.clip(L + weight * (L - Lb), 0, 255)
+    lab_s = cv2.merge([Ls, A, B]).astype(np.uint8)
+    return cv2.cvtColor(lab_s, cv2.COLOR_LAB2BGR)
 
-# ==============================
-# Edge & channel builders (used AFTER tiling, inside dataset)
-# ==============================
-def _norm01(x, eps=1e-6):
-    x = x.astype(np.float32)
-    mn, mx = x.min(), x.max()
-    return np.zeros_like(x, dtype=np.float32) if mx - mn < eps else (x - mn) / (mx - mn)
+def nlm_rgb_to_rgb(bgr: np.ndarray, h: int = NLM_H, t: int = NLM_T, s: int = NLM_S) -> np.ndarray:
+    """NLM per-channel in RGB space, returns RGB uint8."""
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    out = np.empty_like(rgb)
+    for c in range(3):
+        out[..., c] = cv2.fastNlMeansDenoising(rgb[..., c], None, h=h, templateWindowSize=t, searchWindowSize=s)
+    return out
 
-def soft_edge_from_L(L_uint8, method="scharr", pre_blur_sigma=0.6):
-    img = L_uint8
-    if pre_blur_sigma > 0:
-        k = int(2 * round(3 * pre_blur_sigma) + 1)
-        img = cv2.GaussianBlur(img, (k, k), pre_blur_sigma)
+def build_6ch_CHW_from_bgr(bgr: np.ndarray) -> np.ndarray:
+    """Return (6,H,W) uint8 = [RGB_raw, RGB_proc] where RGB_proc = Unsharp(L) -> NLM(RGB)."""
+    rgb_raw  = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    bgr_usm  = unsharp_L_on_BGR(bgr)
+    rgb_proc = nlm_rgb_to_rgb(bgr_usm)
+    six_hwc  = np.dstack([rgb_raw, rgb_proc]).astype(np.uint8)  # (H,W,6)
+    six_chw  = six_hwc.transpose(2, 0, 1)                       # (6,H,W)  
+    return six_chw
 
-    if method == "scharr":
-        gx = cv2.Scharr(img, cv2.CV_32F, 1, 0)
-        gy = cv2.Scharr(img, cv2.CV_32F, 0, 1)
-        mag = np.abs(gx) + np.abs(gy)
-        return _norm01(mag)
-    elif method == "morphgrad":
-        k = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-        dil = cv2.dilate(img, k, iterations=1)
-        ero = cv2.erode(img, k, iterations=1)
-        return _norm01(cv2.subtract(dil, ero))
-    else:
-        gx = cv2.Sobel(img, cv2.CV_32F, 1, 0, ksize=3)
-        gy = cv2.Sobel(img, cv2.CV_32F, 0, 1, ksize=3)
-        return _norm01(np.sqrt(gx*gx + gy*gy))
+# ---------- IO helpers ----------
+IMG_EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff"}
 
+def ensure_dirs(*dirs):
+    for d in dirs:
+        Path(d).mkdir(parents=True, exist_ok=True)
 
-# ==============================
-# 6-Channel Dataset (build channels per tile)
-# ==============================
-class MultiChannelYOLODataset(YOLODataset):
-    """YOLODataset that returns HxWx6 uint8 images (pads/trims channels as needed)."""
+def convert_folder_to_6ch_tiff_like_ultra(src_img_dir: str, dst_img_dir: str) -> list:
+    ensure_dirs(dst_img_dir)
+    out_paths = []
+    for p in tqdm(sorted(Path(src_img_dir).iterdir()), desc=f"6ch:{Path(src_img_dir).name}"):
+        if p.suffix.lower() not in IMG_EXTS:
+            continue
+        bgr = cv2.imread(str(p), cv2.IMREAD_COLOR)
+        if bgr is None:
+            print(f"[WARN] cannot read: {p}")
+            continue
 
-    def _ensure_six(self, img: np.ndarray) -> np.ndarray:
-        if img.ndim == 2:
-            img = img[..., None]
-        if img.ndim != 3:
-            raise ValueError(f"Unexpected image ndim={img.ndim}; expected 2 or 3.")
-        h, w, c = img.shape
-        if img.dtype != np.uint8:
-            img = np.clip(img, 0, 255).astype(np.uint8)
-        if c == channels:
-            return img
-        if c > channels:
-            return img[:, :, :channels]
-        pad = np.zeros((h, w, channels - c), dtype=np.uint8)
-        return np.concatenate([img, pad], axis=2)
+        six_chw = build_6ch_CHW_from_bgr(bgr)  # (6,H,W) uint8
 
-    def load_image(self, i: int):
-        p = self.im_files[i]
-        im = cv2.imread(p, cv2.IMREAD_COLOR)  # force 3ch
-        if im is None:
-            raise FileNotFoundError(f"Failed to read image: {p}")
-        h0, w0 = im.shape[:2]
-    
-        # Build extra channels
-        L = cv2.cvtColor(im, cv2.COLOR_BGR2GRAY)
-        # CLAHE on L
-        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
-        L_clahe = clahe.apply(L)
-        # Soft edges on L
-        # edge = (soft_edge_from_L(L, method="scharr") * 255).astype(np.uint8)
-        # Denoised L
-        L_nlm = cv2.fastNlMeansDenoising(L, None, 10, 7, 21)
-    
-        six = np.dstack([im, L_clahe, L_nlm])
-        if not six.flags["C_CONTIGUOUS"]:
-            six = np.ascontiguousarray(six)
-        return six, (h0, w0), six.shape[:2]
+        op = Path(dst_img_dir) / (p.stem + ".tiff")
+        save_tiff_multipage_from_chw(six_chw, str(op))
+        out_paths.append(str(op.resolve()))
+    return out_paths
 
-def patch_first_conv(model: nn.Module, in_ch: int = channels) -> bool:
-    for name, m in model.named_modules():
-        if isinstance(m, nn.Conv2d) and m.in_channels == 3 and m.groups == 1:
-            old = m
-            dev = old.weight.device
-            dt  = old.weight.dtype
+def mirror_labels_by_stem(src_lbl_dir: str, dst_lbl_dir: str, stems: list):
+    """Copy .txt labels with the same stem names into dst_lbl_dir."""
+    ensure_dirs(dst_lbl_dir)
+    copied, missing = 0, 0
+    for s in stems:
+        src = Path(src_lbl_dir) / f"{s}.txt"
+        dst = Path(dst_lbl_dir) / f"{s}.txt"
+        if src.exists():
+            shutil.copy2(src, dst)
+            copied += 1
+        else:
+            missing += 1
+    print(f"[INFO] labels copied={copied}, missing={missing} → {dst_lbl_dir}")
 
-            new = nn.Conv2d(
-                in_ch, old.out_channels, old.kernel_size, old.stride,
-                old.padding, old.dilation, groups=1, bias=(old.bias is not None)
-            ).to(device=dev, dtype=dt)
+def save_tiff_multipage_from_chw(chw: np.ndarray, out_path: str):
+    """
+    Save a (C, H, W) uint8 array as a multi-page TIFF file using OpenCV's imwritemulti.
+    Each channel becomes a separate page in the TIFF file.
 
-            with torch.no_grad():
-                reps = in_ch // 3
-                rem  = in_ch % 3
-                inflated = old.weight.detach().clone().repeat(1, reps, 1, 1)
-                if rem:
-                    inflated = torch.cat([inflated, old.weight[:, :rem]], dim=1)
-                inflated *= 3.0 / float(in_ch)
-                new.weight.copy_(inflated.to(dev, dt))
-                if old.bias is not None:
-                    new.bias.copy_(old.bias.detach().to(dev, dt))
+    Args:
+        chw (np.ndarray): Image array of shape (C, H, W), dtype=uint8.
+        out_path (str): Output file path (.tiff).
+    """
+    if not hasattr(cv2, "imwritemulti"):
+        raise RuntimeError("Your OpenCV build does not have 'imwritemulti'. "
+                           "Please install opencv-python>=4.8 with TIFF support.")
 
-            parent = model
-            *parents, last = name.split(".")
-            for p in parents:
-                parent = getattr(parent, p)
-            setattr(parent, last, new)
+    if chw.ndim != 3:
+        raise ValueError(f"Expected array with shape (C, H, W), got {chw.shape}")
 
-            print(f"[INFO] Patched first Conv2d: in_channels 3 → {in_ch} ✔ ({name}) on {dev}, {dt}")
-            return True
-    print("[WARN] Could not find a 3-channel Conv2d to patch.")
-    return False
+    # Convert channel-first (C,H,W) to list of (H,W) pages
+    pages = [np.ascontiguousarray(chw[c].astype(np.uint8, copy=False)) for c in range(chw.shape[0])]
 
+    out_dir = os.path.dirname(out_path)
+    os.makedirs(out_dir, exist_ok=True)
 
+    ok = cv2.imwritemulti(str(out_path), pages)
+    if not ok:
+        raise RuntimeError(f"cv2.imwritemulti failed for: {out_path}")
 
-# =========================
-# Trainer: OBB + 6-channel safe
-# =========================
-class MultiChannelTrainer(OBBTrainer):
-    """OBB trainer configured for 6-channel inputs and safe augments."""
-
-    def final_eval(self):
-        print("[INFO] Skipping post-training final_eval() to avoid post-epoch errors.")
-        return
-    
-    # turn off color & multi-image augments that assume 3 channels
-    def build_dataset(self, img_path, mode="train", batch=None):
-        self.args.task = "obb"
-        self.args.hsv_h = self.args.hsv_s = self.args.hsv_v = 0.0
-        self.args.mosaic = 0.0
-        self.args.mixup = 0.0
-        self.args.copy_paste = 0.0
-        self.args.plots = False
-
-        return MultiChannelYOLODataset(
-            img_path=img_path,
-            imgsz=self.args.imgsz,
-            batch_size=self.args.batch if batch is None else batch,
-            augment=(mode == "train"),
-            hyp=self.args,
-            rect=self.args.rect,
-            cache=self.args.cache or None,
-            prefix=f"{mode}: ",
-            task=self.args.task,
-            classes=self.args.classes,
-            data=self.data
-        )
-
-    def get_model(self, cfg=None, weights=None, verbose=True):
-        try:
-            model = super().get_model(cfg=cfg, weights=weights, verbose=verbose, in_channels=channels)
-            print(f"[check] get_model accepted in_channels={channels}")
-        except TypeError:
-            model = super().get_model(cfg=cfg, weights=weights, verbose=verbose)
-            print("[check] get_model does NOT accept in_channels; will patch Conv.")
-    
-        try:
-            first = next(m for m in model.modules() if isinstance(m, nn.Conv2d))
-            print(f"[check] first Conv2d in_channels BEFORE patch = {first.in_channels}")
-        except StopIteration:
-            print("[check] No Conv2d found for sanity check.")
-    
-        ok = patch_first_conv(model, in_ch=channels)
-        print(">>> PATCH MAIN RESULT =", ok)
-        dev = torch.cuda.current_device() if torch.cuda.is_available() else "cpu"
-        print(f"[INFO] Device={dev}, RANK={os.getenv('RANK')}, LOCAL_RANK={os.getenv('LOCAL_RANK')}")
-        
-        return model
-
-
-def on_fit_start_cb(trainer):
-    if getattr(trainer, "ema", None) and getattr(trainer.ema, "ema", None): 
-        try:
-            patch_first_conv(trainer.ema.ema, in_ch=channels)
-        except Exception:
-            pass
-        
-def on_preprocess_batch_end(trainer, batch):
-    imgs = batch.get("img", None)
-    if imgs is not None and imgs.dtype != torch.float32:
-        batch["img"] = imgs.float()
-
-def on_val_batch_start(*args, **kwargs):
-    if len(args) >= 3:
-        _, batch, _ = args[:3]
-    elif len(args) == 2:
-        _, batch = args
-    else:
-        batch = kwargs.get("batch")
-
-    import torch
-    if isinstance(batch, dict):
-        x = batch.get("img", None) or batch.get("imgs", None)
-        if isinstance(x, torch.Tensor) and x.ndim == 4 and x.shape[1] == 3:
-            batch["img"] = torch.cat([x, x], dim=1)[:, :channels]
-            
+      
 # ==============================
 # Main
 # ==============================
 if __name__ == "__main__":
             
     # 1) Tiling 
-    if NEED_CROPPING and os.getenv("RANK") is None:
+    if NEED_CROPPING:
         crop_images_and_labels(
             image_dir=TRAIN_IMG_DIR,
             label_dir=TRAIN_LBL_DIR,
@@ -476,7 +431,7 @@ if __name__ == "__main__":
         )
 
     # 2) Class balancing on CROPPED tiles
-    if NEED_AUGMENTATION and os.getenv("RANK") is None:
+    if NEED_AUGMENTATION:
         balance_classes(
             image_dir=TRAIN_OUT_IMG_DIR,
             label_dir=TRAIN_OUT_LBL_DIR,
@@ -490,10 +445,26 @@ if __name__ == "__main__":
             list_file=VAL_LIST_CROPPED,
             class_balance_threshold=CLASS_BALANCE_THRESHOLD,
             augmentation_repeats=AUGMENTATION_REPEATS
-        )
+        )   
+        
+    if NEED_6CHANNEL: 
+        train_out_paths = convert_folder_to_6ch_tiff_like_ultra(TRAIN_OUT_IMG_DIR, TRAIN_OUT_IMG6_DIR)
+        val_out_paths   = convert_folder_to_6ch_tiff_like_ultra(VAL_OUT_IMG_DIR,   VAL_OUT_IMG6_DIR)
+    
+        train_stems = [Path(p).stem for p in train_out_paths]
+        val_stems   = [Path(p).stem for p in val_out_paths]
+        mirror_labels_by_stem(TRAIN_OUT_LBL_DIR, TRAIN_OUT_LBL6_DIR, train_stems)
+        mirror_labels_by_stem(VAL_OUT_LBL_DIR,   VAL_OUT_LBL6_DIR,   val_stems)
+    
+        write_list(TRAIN_LIST_6CH, train_out_paths)
+        write_list(VAL_LIST_6CH,   val_out_paths)
+        print(f"[OK] wrote {len(train_out_paths)} train and {len(val_out_paths)} val 6-ch .tiff files")
+        print(f"[OK] lists:\n  {TRAIN_LIST_6CH}\n  {VAL_LIST_6CH}")
 
-    overrides = dict(
-        model=PRETRAINED,
+    model = YOLO("yolo11x-obb.pt")
+
+    # Size 128
+    model.train(
         data=DATA_YAML,
         epochs=EPOCHS,
         imgsz=TILE_SIZE,
@@ -510,33 +481,31 @@ if __name__ == "__main__":
         patience=10000,
         plots=False,              
         overlap_mask=False,
-        task='obb',
-        mosaic=0.0, mixup=0.0, copy_paste=0.0,
-        hsv_h=0.0, hsv_s=0.0, hsv_v=0.0,
-        amp=False
+        # task='obb',
+        # mosaic=0.0, mixup=0.0, copy_paste=0.0,
+        # hsv_h=0.0, hsv_s=0.0, hsv_v=0.0,
+        # amp=False
     )
-
     
-    if Dual_GPU:
-        if os.getenv("RANK") is None:  
-            DEV = "0,1"  
-            if "," in DEV:  
-                nproc = len(DEV.split(","))
-                os.environ.setdefault("CUDA_VISIBLE_DEVICES", DEV)
-                os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-                os.environ.setdefault("MASTER_PORT", "29501")  
-                os.environ.setdefault("TORCH_DISTRIBUTED_DEBUG", "DETAIL")
-                os.environ.setdefault("NCCL_IB_DISABLE", "1")
-                os.environ.setdefault("NCCL_P2P_DISABLE", "1")
-                this = os.path.abspath(inspect.getfile(sys.modules[__name__]))
-                cmd = [sys.executable, "-m", "torch.distributed.run",
-                        "--nproc_per_node", str(nproc),
-                        "--master_port", os.environ["MASTER_PORT"],
-                        this]
-                raise SystemExit(subprocess.run(cmd, check=True).returncode)
-    
-    trainer = MultiChannelTrainer(overrides=overrides)
-    trainer.add_callback("on_fit_start", on_fit_start_cb)
-    trainer.add_callback("on_preprocess_batch_end", on_preprocess_batch_end)
-    trainer.add_callback("on_val_batch_start", on_val_batch_start)           
-    trainer.train()
+    # # Size 416
+    # model.train(
+    #     data=DATA_YAML,
+    #     epochs=EPOCHS,
+    #     imgsz=TILE_SIZE,
+    #     batch=BATCH_SIZE,
+    #     workers=WORKERS,
+    #     cache=CACHE,
+    #     rect=RECT,
+    #     device=DEVICE,
+    #     multi_scale=False,
+    #     lr0 = 0.002,  
+    #     lrf = 0.05,      
+    #     weight_decay = 0.001, 
+    #     dropout = 0.2,
+    #     # warmup_epochs = 5.0,
+    #     # warmup_momentum = 0.85,
+    #     # warmup_bias_lr = 0.08,
+    #     patience=10000,
+    #     plots = False,
+    #     overlap_mask = False,
+    # )

@@ -1,5 +1,5 @@
 numpy==1.26.4
 opencv-python==4.11.0.86
-ultralytics==8.3.78
+ultralytics==8.3.196
 shapely==2.0.7
 openpyxl==3.1.5
