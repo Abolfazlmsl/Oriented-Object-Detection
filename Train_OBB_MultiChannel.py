@@ -15,6 +15,9 @@ from ultralytics import YOLO
 import numpy as np
 from scipy.ndimage import gaussian_filter
 
+CHANNELS = 3               # set to 3, 4, or 6
+APPLY_FILTERED_RGB = False
+
 # Configuration
 need_cropping = False 
 need_augmentation = False
@@ -50,6 +53,21 @@ def update_txt_file(txt_file, new_paths):
     with open(txt_file, "w") as f:
         for path in new_paths:
             f.write(f"{path}\n")
+
+def save_tiff_multipage_from_chw(chw: np.ndarray, out_path: str):
+    """
+    Save (C, H, W) uint8 as a multi-page .tiff using OpenCV's imwritemulti.
+    Each channel is written as a separate page.
+    """
+    if not hasattr(cv2, "imwritemulti"):
+        raise RuntimeError("Your OpenCV build lacks 'imwritemulti'. Install opencv-python with TIFF support.")
+    assert chw.ndim == 3 and chw.shape[0] in (4, 6), f"Expected (4,H,W) or (6,H,W), got {chw.shape}"
+    pages = [np.ascontiguousarray(chw[c].astype(np.uint8, copy=False)) for c in range(chw.shape[0])]
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    ok = cv2.imwritemulti(str(out_path), pages)
+    if not ok:
+        raise RuntimeError(f"cv2.imwritemulti failed for: {out_path}")
+
         
 def convert_to_grayscale(image):
     """
@@ -379,6 +397,66 @@ def filter_folder_rgb(src_img_dir: str, src_lbl_dir: str,
     mirror_labels_by_stem(src_lbl_dir, dst_lbl_dir, stems)
     return out_paths
 
+def build_4ch_CHW_from_bgr(bgr: np.ndarray) -> np.ndarray:
+    """
+    Returns (4, H, W) uint8 = [R, G, B, L_proc]
+    where L_proc = NLM( Unsharp(L in LAB) ).
+    """
+    rgb_raw = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)                       # (H,W,3)
+    lab32   = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+    L, A, B = cv2.split(lab32)
+    Lb      = cv2.GaussianBlur(L, (0, 0), sigmaX=USM_RADIUS, sigmaY=USM_RADIUS, borderType=cv2.BORDER_REFLECT_101)
+    Ls      = np.clip(L + USM_WEIGHT * (L - Lb), 0, 255).astype(np.uint8)  # sharpened L
+    L_proc  = cv2.fastNlMeansDenoising(Ls, None, h=NLM_H, templateWindowSize=NLM_T, searchWindowSize=NLM_S)
+    four_hwc = np.dstack([rgb_raw, L_proc]).astype(np.uint8)             # (H,W,4)
+    four_chw = four_hwc.transpose(2, 0, 1)                               # (4,H,W)
+    return np.ascontiguousarray(four_chw)
+
+def build_6ch_CHW_from_bgr(bgr: np.ndarray) -> np.ndarray:
+    """
+    Returns (6, H, W) uint8 = [RGB_raw, RGB_proc]
+    where RGB_proc = NLM( Unsharp(L in LAB) applied to BGR then converted to RGB ).
+    """
+    rgb_raw  = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)                      # (H,W,3)
+    bgr_usm  = unsharp_L_on_BGR(bgr, radius=USM_RADIUS, weight=USM_WEIGHT)
+    rgb_proc = nlm_rgb_to_rgb(bgr_usm, h=NLM_H, t=NLM_T, s=NLM_S)        # (H,W,3)
+    six_hwc  = np.dstack([rgb_raw, rgb_proc]).astype(np.uint8)           # (H,W,6)
+    six_chw  = six_hwc.transpose(2, 0, 1)                                # (6,H,W)
+    return np.ascontiguousarray(six_chw)
+
+IMG_EXTS = (".jpg", ".jpeg", ".png")
+
+def convert_folder_to_4ch_tiff(src_img_dir: str, dst_img_dir: str) -> list:
+    os.makedirs(dst_img_dir, exist_ok=True)
+    out_paths = []
+    for fn in sorted(os.listdir(src_img_dir)):
+        if not fn.lower().endswith(IMG_EXTS): 
+            continue
+        ip = os.path.join(src_img_dir, fn)
+        bgr = cv2.imread(ip, cv2.IMREAD_COLOR)
+        if bgr is None:
+            print(f"[WARN] cannot read: {ip}"); continue
+        four_chw = build_4ch_CHW_from_bgr(bgr)  # (4,H,W)
+        op = os.path.join(dst_img_dir, os.path.splitext(fn)[0] + ".tiff")
+        save_tiff_multipage_from_chw(four_chw, op)
+        out_paths.append(os.path.abspath(op))
+    return out_paths
+
+def convert_folder_to_6ch_tiff(src_img_dir: str, dst_img_dir: str) -> list:
+    os.makedirs(dst_img_dir, exist_ok=True)
+    out_paths = []
+    for fn in sorted(os.listdir(src_img_dir)):
+        if not fn.lower().endswith(IMG_EXTS):
+            continue
+        ip = os.path.join(src_img_dir, fn)
+        bgr = cv2.imread(ip, cv2.IMREAD_COLOR)
+        if bgr is None:
+            print(f"[WARN] cannot read: {ip}"); continue
+        six_chw = build_6ch_CHW_from_bgr(bgr)   # (6,H,W)
+        op = os.path.join(dst_img_dir, os.path.splitext(fn)[0] + ".tiff")
+        save_tiff_multipage_from_chw(six_chw, op)
+        out_paths.append(os.path.abspath(op))
+    return out_paths
 
 if __name__ == "__main__":
     
@@ -395,6 +473,21 @@ if __name__ == "__main__":
     val_output_label_dir = "datasets/GeoMap/cropped/labels/val"
     val_txt_file = "datasets/GeoMap/val.txt"
     val_cropped_txt_file = "datasets/GeoMap/val_cropped.txt"
+    
+    # 4ch and 6ch output roots (parallel to cropped/)
+    out_img4_train = "datasets/GeoMap/cropped4/images/train"
+    out_lbl4_train = "datasets/GeoMap/cropped4/labels/train"
+    out_img4_val   = "datasets/GeoMap/cropped4/images/val"
+    out_lbl4_val   = "datasets/GeoMap/cropped4/labels/val"
+    train_list_4ch = "datasets/GeoMap/train_cropped_4ch.txt"
+    val_list_4ch   = "datasets/GeoMap/val_cropped_4ch.txt"
+    
+    out_img6_train = "datasets/GeoMap/cropped6/images/train"
+    out_lbl6_train = "datasets/GeoMap/cropped6/labels/train"
+    out_img6_val   = "datasets/GeoMap/cropped6/images/val"
+    out_lbl6_val   = "datasets/GeoMap/cropped6/labels/val"
+    train_list_6ch = "datasets/GeoMap/train_cropped_6ch.txt"
+    val_list_6ch   = "datasets/GeoMap/val_cropped_6ch.txt"
 
     f_output_image_dir = "datasets/GeoMap/cropped_filt/images/train"
     f_output_label_dir = "datasets/GeoMap/cropped_filt/labels/train"
@@ -444,31 +537,64 @@ if __name__ == "__main__":
             augmentation_repeats=augmentation_repeats 
         )
 
-    if apply_filtered_rgb:
-        print("[INFO] Creating filtered copies (Unsharp->NLM) from cropped(+aug) sets...")
-        train_filtered_paths = filter_folder_rgb(
-            src_img_dir=output_image_dir,
-            src_lbl_dir=output_label_dir,
-            dst_img_dir=f_output_image_dir,
-            dst_lbl_dir=f_output_label_dir
-        )
-        val_filtered_paths = filter_folder_rgb(
-            src_img_dir=val_output_image_dir,
-            src_lbl_dir=val_output_label_dir,
-            dst_img_dir=f_val_output_image_dir,
-            dst_lbl_dir=f_val_output_label_dir
-        )
+    # ===== Build training/val inputs based on CHANNELS =====
+    if CHANNELS == 3:
+        if APPLY_FILTERED_RGB:
+            print("[INFO] Creating filtered RGB copies for 3-channel training...")
+            train_filtered_paths = filter_folder_rgb(
+                src_img_dir=output_image_dir,
+                src_lbl_dir=output_label_dir,
+                dst_img_dir=f_output_image_dir,
+                dst_lbl_dir=f_output_label_dir
+            )
+            val_filtered_paths = filter_folder_rgb(
+                src_img_dir=val_output_image_dir,
+                src_lbl_dir=val_output_label_dir,
+                dst_img_dir=f_val_output_image_dir,
+                dst_lbl_dir=f_val_output_label_dir
+            )
+            with open(train_filtered_list, "w") as f:
+                for p in train_filtered_paths: f.write(p + "\n")
+            with open(val_filtered_list, "w") as f:
+                for p in val_filtered_paths: f.write(p + "\n")
+            DATA_YAML = "datasets/GeoMap/data_filt.yaml"
+        else:
+            DATA_YAML = "datasets/GeoMap/data.yaml"
     
-        with open(train_filtered_list, "w") as f:
-            for p in train_filtered_paths:
-                f.write(p + "\n")
-        with open(val_filtered_list, "w") as f:
-            for p in val_filtered_paths:
-                f.write(p + "\n")
+    elif CHANNELS == 4:
+        print("[INFO] Converting cropped(+aug) to 4-channel multi-page TIFFs...")
+        tr_paths = convert_folder_to_4ch_tiff(output_image_dir, out_img4_train)
+        va_paths = convert_folder_to_4ch_tiff(val_output_image_dir, out_img4_val)
+        # mirror labels by stem
+        tr_stems = [os.path.splitext(os.path.basename(p))[0] for p in tr_paths]
+        va_stems = [os.path.splitext(os.path.basename(p))[0] for p in va_paths]
+        mirror_labels_by_stem(output_label_dir, out_lbl4_train, tr_stems)
+        mirror_labels_by_stem(val_output_label_dir, out_lbl4_val, va_stems)
+        # write train/val lists
+        with open(train_list_4ch, "w") as f:
+            for p in tr_paths: f.write(p + "\n")
+        with open(val_list_4ch, "w") as f:
+            for p in va_paths: f.write(p + "\n")
+        DATA_YAML = "datasets/GeoMap/data4ch.yaml"  # create yaml that points to cropped4/images/{train,val}
+    
+    elif CHANNELS == 6:
+        print("[INFO] Converting cropped(+aug) to 6-channel multi-page TIFFs...")
+        tr_paths = convert_folder_to_6ch_tiff(output_image_dir, out_img6_train)
+        va_paths = convert_folder_to_6ch_tiff(val_output_image_dir, out_img6_val)
+        tr_stems = [os.path.splitext(os.path.basename(p))[0] for p in tr_paths]
+        va_stems = [os.path.splitext(os.path.basename(p))[0] for p in va_paths]
+        mirror_labels_by_stem(output_label_dir, out_lbl6_train, tr_stems)
+        mirror_labels_by_stem(val_output_label_dir, out_lbl6_val, va_stems)
+        with open(train_list_6ch, "w") as f:
+            for p in tr_paths: f.write(p + "\n")
+        with open(val_list_6ch, "w") as f:
+            for p in va_paths: f.write(p + "\n")
+        DATA_YAML = "datasets/GeoMap/data6ch.yaml"  # create yaml that points to cropped6/images/{train,val}
+    
+    else:
+        raise ValueError("CHANNELS must be 3, 4, or 6")
     
     model = YOLO("yolo11x-obb.pt")
-    
-    DATA_YAML = "datasets/GeoMap/data_filt.yaml" if apply_filtered_rgb else "datasets/GeoMap/data.yaml"
     
     # Size 128
     model.train(

@@ -20,18 +20,21 @@ from ultralytics.models.yolo.obb.predict import OBBPredictor
 # =========================
 # Config
 # =========================
-channels = 6         # set to 3, 4, 5, or 6
+channels = 4         # set to 3, 4, or 6 
+APPLY_FILTER_3CH = False  
+
+USM_RADIUS = 7.0
+USM_WEIGHT = 1.40
+NLM_H = 7
+NLM_T = 7
+NLM_S = 21
+
 calculate_metrics = True
 tile_sizes = [128, 416]
 overlaps = [20, 50]
 iou_threshold = 0.2
 models = [YOLO("best128.pt"), YOLO("best416.pt")]
 
-USM_RADIUS = 7.0    
-USM_WEIGHT = 1.40   
-NLM_H      = 7
-NLM_T      = 7
-NLM_S      = 21
 
 # Classes/colors/names
 CLASS_COLORS = {
@@ -109,7 +112,7 @@ def _nlm_rgb_to_rgb(bgr_img, h=NLM_H, t=NLM_T, s=NLM_S):
     rgb = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2RGB)
     rgb_d = np.empty_like(rgb)
     for c in range(3):
-        rgb_d[:,:,c] = cv2.fastNlMeansDenoising(rgb[:,:,c], None, h=h, templateWindowSize=t, searchWindowSize=s)
+        rgb_d[:, :, c] = cv2.fastNlMeansDenoising(rgb[:, :, c], None, h=h, templateWindowSize=t, searchWindowSize=s)
     return rgb_d  # uint8 RGB
 
 
@@ -211,52 +214,38 @@ def run_inference_on_crop(crop_bgr, model, imgsz):
 
 def build_multich(bgr: np.ndarray, out_channels: int = channels) -> np.ndarray:
     """
-    Build multi-channel per-crop exactly like training:
-      6ch = [RGB_raw, RGB_proc] where RGB_proc = Unsharp(L in LAB) -> NLM(RGB).
-    If out_channels == 3: returns only RGB_raw (for 3ch models).
+    Build per-crop multi-channel exactly like training:
+      3ch: if APPLY_FILTER_3CH -> RGB_proc (Unsharp(L)->NLM on RGB), else RGB_raw
+      4ch: [RGB_raw, L_proc] where L_proc = NLM( Unsharp(L in LAB) )
+      6ch: [RGB_raw, RGB_proc] where RGB_proc = NLM( Unsharp(L in LAB) -> RGB )
+    Returns HxWxC uint8.
     """
-    # RGB raw
+    assert out_channels in (3, 4, 6), f"Unsupported out_channels={out_channels}"
     rgb_raw = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
-    # Unsharp on L in LAB (ImageJ-like), then NLM on each RGB channel
-    bgr_usm  = _unsharp_imagej(bgr, radius=USM_RADIUS, weight=USM_WEIGHT)
-    rgb_proc = _nlm_rgb_to_rgb(bgr_usm, h=NLM_H, t=NLM_T, s=NLM_S)  # uint8 RGB
-
     if out_channels == 3:
-        multich = rgb_raw
-    elif out_channels == 6:
-        multich = np.dstack([rgb_raw, rgb_proc]).astype(np.uint8)  # (H,W,6)
-    else:
-        raise ValueError(f"Unsupported out_channels={out_channels}. Use 3 or 6.")
+        if APPLY_FILTER_3CH:
+            bgr_usm = _unsharp_imagej(bgr, radius=USM_RADIUS, weight=USM_WEIGHT)
+            rgb_proc = _nlm_rgb_to_rgb(bgr_usm, h=NLM_H, t=NLM_T, s=NLM_S)  # (H,W,3) uint8
+            multich = rgb_proc
+        else:
+            multich = rgb_raw
+
+    elif out_channels == 4:
+        # L_proc = NLM( Unsharp(L in LAB) )
+        lab32 = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+        L, A, B = cv2.split(lab32)
+        L_blur  = cv2.GaussianBlur(L, (0, 0), sigmaX=USM_RADIUS, sigmaY=USM_RADIUS, borderType=cv2.BORDER_REFLECT_101)
+        L_sharp = np.clip(L + USM_WEIGHT * (L - L_blur), 0, 255).astype(np.uint8)
+        L_proc  = cv2.fastNlMeansDenoising(L_sharp, None, h=NLM_H, templateWindowSize=NLM_T, searchWindowSize=NLM_S)
+        multich = np.dstack([rgb_raw, L_proc]).astype(np.uint8)  # (H,W,4)
+
+    else:  # out_channels == 6
+        bgr_usm  = _unsharp_imagej(bgr, radius=USM_RADIUS, weight=USM_WEIGHT)
+        rgb_proc = _nlm_rgb_to_rgb(bgr_usm, h=NLM_H, t=NLM_T, s=NLM_S)  # (H,W,3) uint8
+        multich  = np.dstack([rgb_raw, rgb_proc]).astype(np.uint8)      # (H,W,6)
 
     return np.ascontiguousarray(multich)
-
-    # if channels > 3:
-    #     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-    #     L_nlm = cv2.fastNlMeansDenoising(gray, None, 10, 7, 21)
-    #     clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-    #     L_clahe = clahe.apply(gray)
-    #     gx = cv2.Scharr(gray, cv2.CV_32F, 1, 0)
-    #     gy = cv2.Scharr(gray, cv2.CV_32F, 0, 1)
-    #     mag = np.abs(gx) + np.abs(gy)
-    #     edge = (255.0 * (mag / (mag.max() + 1e-6))).astype(np.uint8)
-
-    # if channels == 4:
-    #     layers.append(L_nlm[..., None])
-
-    # elif channels == 5:
-    #     layers.append(L_clahe[..., None])
-    #     layers.append(L_nlm[..., None])
-
-    # elif channels == 6:
-    #     layers.append(L_clahe[..., None])
-    #     layers.append(edge[..., None])
-    #     layers.append(L_nlm[..., None])
-
-    # multich = np.dstack(layers)
-    
-    # multich = np.dstack([rgb_raw, rgb_proc]).astype(np.uint8)
-    # return np.ascontiguousarray(multich)
 
 
 # =========================
