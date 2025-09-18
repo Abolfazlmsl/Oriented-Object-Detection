@@ -14,6 +14,7 @@ import torch
 from ultralytics import YOLO
 import numpy as np
 from scipy.ndimage import gaussian_filter
+from sklearn.cluster import KMeans
 
 CHANNELS = 3               # set to 3, 4, or 6
 APPLY_FILTERED_RGB = False
@@ -34,10 +35,9 @@ class_balance_threshold = 400  # Minimum number of samples per class for balance
 augmentation_repeats = 2  # Number of times to augment underrepresented classes
 
 # === Filtering ===
-apply_filtered_rgb = False
 USM_RADIUS = 7.0           
-USM_WEIGHT = 1.40            
-NLM_H = 7                    
+USM_WEIGHT = 0.6            
+NLM_H = 3                    
 NLM_T = 7                   
 NLM_S = 21  
 
@@ -458,6 +458,217 @@ def convert_folder_to_6ch_tiff(src_img_dir: str, dst_img_dir: str) -> list:
         out_paths.append(os.path.abspath(op))
     return out_paths
 
+def convert_folder_to_4ch_tiff_palette(src_img_dir: str, dst_img_dir: str,
+                                       centers_rgb: np.ndarray) -> list:
+    os.makedirs(dst_img_dir, exist_ok=True)
+    out_paths = []
+    for fn in sorted(os.listdir(src_img_dir)):
+        if not fn.lower().endswith(IMG_EXTS): 
+            continue
+        ip = os.path.join(src_img_dir, fn)
+        bgr = cv2.imread(ip, cv2.IMREAD_COLOR)
+        if bgr is None:
+            print(f"[WARN] cannot read: {ip}"); 
+            continue
+        four_chw = build_4ch_CHW_from_bgr_palette(bgr, centers_rgb)  # (4,H,W)
+        op = os.path.join(dst_img_dir, os.path.splitext(fn)[0] + ".tiff")
+        save_tiff_multipage_from_chw(four_chw, op)
+        out_paths.append(os.path.abspath(op))
+    return out_paths
+
+def convert_folder_to_4ch_tiff_msedge(src_img_dir: str, dst_img_dir: str,
+                                      sigmas=(0,1.0,2.0,4.0)) -> list:
+    os.makedirs(dst_img_dir, exist_ok=True)
+    out_paths = []
+    for fn in sorted(os.listdir(src_img_dir)):
+        if not fn.lower().endswith(IMG_EXTS): 
+            continue
+        ip = os.path.join(src_img_dir, fn)
+        bgr = cv2.imread(ip, cv2.IMREAD_COLOR)
+        if bgr is None:
+            print(f"[WARN] cannot read: {ip}"); continue
+        four_chw = build_4ch_CHW_from_bgr_msedge(bgr, sigmas=sigmas)
+        op = os.path.join(dst_img_dir, os.path.splitext(fn)[0] + ".tiff")
+        save_tiff_multipage_from_chw(four_chw, op)
+        out_paths.append(os.path.abspath(op))
+    return out_paths
+
+def convert_folder_to_4ch_tiff_dtedge(src_img_dir: str, dst_img_dir: str,
+                                      sigmas=(0,0.8,1.6,3.2), **kwargs) -> list:
+    os.makedirs(dst_img_dir, exist_ok=True)
+    out_paths = []
+    for fn in sorted(os.listdir(src_img_dir)):
+        if not fn.lower().endswith(IMG_EXTS):
+            continue
+        ip = os.path.join(src_img_dir, fn)
+        bgr = cv2.imread(ip, cv2.IMREAD_COLOR)
+        if bgr is None:
+            print(f"[WARN] cannot read: {ip}"); continue
+        four_chw = build_4ch_CHW_from_bgr_dtedge(bgr, sigmas=sigmas, **kwargs)
+        op = os.path.join(dst_img_dir, os.path.splitext(fn)[0] + ".tiff")
+        save_tiff_multipage_from_chw(four_chw, op)
+        out_paths.append(os.path.abspath(op))
+    return out_paths
+
+def fit_kmeans_on_folder(src_img_dir: str, n_colors: int = 15, sample_per_image: int = 5000, seed: int = 0):
+    rng = np.random.RandomState(seed)
+    samples = []
+    exts = (".jpg", ".jpeg", ".png")
+    for fn in sorted(os.listdir(src_img_dir)):
+        if not fn.lower().endswith(exts):
+            continue
+        ip = os.path.join(src_img_dir, fn)
+        bgr = cv2.imread(ip, cv2.IMREAD_COLOR)
+        if bgr is None: 
+            continue
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB).reshape(-1, 3)
+        if rgb.shape[0] > sample_per_image:
+            idx = rng.choice(rgb.shape[0], sample_per_image, replace=False)
+            rgb = rgb[idx]
+        samples.append(rgb)
+    if not samples:
+        raise RuntimeError(f"No images found in {src_img_dir} for KMeans.")
+    X = np.concatenate(samples, axis=0).astype(np.float32)
+    km = KMeans(n_clusters=n_colors, random_state=seed, n_init="auto")
+    km.fit(X)
+    return km.cluster_centers_.astype(np.float32)  
+
+def quantize_rgb_with_centers(bgr: np.ndarray, centers_rgb: np.ndarray) -> np.ndarray:
+
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB).astype(np.float32)
+    H, W, _ = rgb.shape
+    flat = rgb.reshape(-1, 3)  # (N,3)
+    dists = ((flat[:, None, :] - centers_rgb[None, :, :]) ** 2).sum(axis=2)
+    labels = np.argmin(dists, axis=1).astype(np.uint8)
+    return labels.reshape(H, W)
+
+def build_4ch_CHW_from_bgr_palette(bgr: np.ndarray, centers_rgb: np.ndarray) -> np.ndarray:
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB).astype(np.uint8)
+    idx = quantize_rgb_with_centers(bgr, centers_rgb)  # (H,W) uint8
+    four = np.dstack([rgb, idx]).astype(np.uint8)      # (H,W,4)
+    return four.transpose(2, 0, 1).copy()              # (4,H,W)
+
+
+# --- Multi-Scale Edge (msEdge) helpers ---
+def _grad_mag(gray: np.ndarray) -> np.ndarray:
+    gx = cv2.Scharr(gray, cv2.CV_32F, 1, 0)
+    gy = cv2.Scharr(gray, cv2.CV_32F, 0, 1)
+    return cv2.magnitude(gx, gy)
+
+def _structure_tensor_coherence(gray: np.ndarray, win: int = 5, sigma: float = 1.0) -> np.ndarray:
+    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    Ixx, Iyy, Ixy = gx*gx, gy*gy, gx*gy
+    if sigma > 0:
+        Ixx = cv2.GaussianBlur(Ixx, (0,0), sigma)
+        Iyy = cv2.GaussianBlur(Iyy, (0,0), sigma)
+        Ixy = cv2.GaussianBlur(Ixy, (0,0), sigma)
+    else:
+        Ixx = cv2.boxFilter(Ixx, -1, (win,win), normalize=True)
+        Iyy = cv2.boxFilter(Iyy, -1, (win,win), normalize=True)
+        Ixy = cv2.boxFilter(Ixy, -1, (win,win), normalize=True)
+    tr  = Ixx + Iyy
+    det = Ixx*Iyy - Ixy*Ixy
+    tmp = np.sqrt((Ixx - Iyy)**2 + 4.0*(Ixy**2))
+    lam1 = (tr + tmp) * 0.5
+    lam2 = (tr - tmp) * 0.5
+    eps = 1e-6
+    coh = (lam1 - lam2) / (lam1 + lam2 + eps)
+    return np.clip(coh, 0, 1)
+
+def cme_edge_channel_from_bgr(bgr: np.ndarray,
+                              sigmas=(0, 1.0, 2.0, 4.0),
+                              coh_win=5, coh_sigma=1.0,
+                              hysteresis=(0.1, 0.3)) -> np.uint8:
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    acc = None
+    for s in sigmas:
+        blur = cv2.GaussianBlur(gray, (0,0), s, s, borderType=cv2.BORDER_REFLECT_101) if s>0 else gray
+        mag  = _grad_mag(blur)
+        acc  = mag if acc is None else np.maximum(acc, mag)
+    # 2) coherence
+    coh = _structure_tensor_coherence(gray, win=coh_win, sigma=coh_sigma)  # 0..1
+    cme = acc * (0.5 + 0.5*coh)   
+
+    lo, hi = np.percentile(cme, [1, 99])
+    cme = np.clip((cme - lo) / max(1e-6, (hi - lo)), 0, 1)
+    # 4) hysteresis optional 
+    tl, th = hysteresis
+    strong = (cme >= th).astype(np.uint8)
+    weak   = ((cme >= tl) & (cme < th)).astype(np.uint8)
+
+    kernel = np.ones((3,3), np.uint8)
+    grown  = cv2.dilate(strong, kernel, iterations=1)
+    keep   = np.where((weak==1) & (grown==1), 1, strong)
+    cme = np.where(keep==1, cme, 0.0)
+    return (cme * 255).astype(np.uint8)
+
+def build_4ch_CHW_from_bgr_msedge(bgr: np.ndarray, sigmas=(0,1.0,2.0,4.0)) -> np.ndarray:
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB).astype(np.uint8)
+    edge = cme_edge_channel_from_bgr(bgr, sigmas=sigmas)                  # (H,W) uint8
+    four = np.dstack([rgb, edge]).astype(np.uint8)                       # (H,W,4)
+    return four.transpose(2, 0, 1).copy()                                # (4,H,W)
+
+# --- DT-Edge (Distance Transform of Multi-Scale Edges) ---
+def _scharr_mag(gray: np.ndarray) -> np.ndarray:
+    gx = cv2.Scharr(gray, cv2.CV_32F, 1, 0)
+    gy = cv2.Scharr(gray, cv2.CV_32F, 0, 1)
+    return cv2.magnitude(gx, gy)
+
+def dt_edge_channel_from_bgr(
+    bgr: np.ndarray,
+    sigmas=(0, 0.8, 1.6, 3.2),
+    bin_method: str = "otsu",  # "percentile" | "otsu"
+    p_hi: int = 85, p_lo: int = 65,
+    morph_open: int = 2
+) -> np.uint8:
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    # multi-scale gradient
+    acc = None
+    for s in sigmas:
+        blur = cv2.GaussianBlur(gray, (0,0), s, s, borderType=cv2.BORDER_REFLECT_101) if s > 0 else gray
+        mag  = _scharr_mag(blur)
+        acc  = mag if acc is None else np.maximum(acc, mag)
+
+    # threshold to edge map
+    if bin_method == "otsu":
+        acc8 = cv2.normalize(acc, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        _, edges = cv2.threshold(acc8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    else:
+        lo, hi = np.percentile(acc, [p_lo, p_hi])
+        edges = (acc >= hi).astype(np.uint8) * 255
+
+    # small morphology clean
+    if morph_open > 0:
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3,3))
+        edges = cv2.morphologyEx(edges, cv2.MORPH_OPEN, k, iterations=morph_open)
+
+    # distance transform on non-edges
+    non_edge = cv2.threshold(edges, 0, 255, cv2.THRESH_BINARY_INV)[1]
+    dist = cv2.distanceTransform(non_edge, cv2.DIST_L2, 3).astype(np.float32)
+
+    # robust normalize (1..99 percentiles)
+    lo, hi = np.percentile(dist, [1, 99])
+    dist = np.clip((dist - lo) / max(1e-6, (hi - lo)), 0, 1)
+    tau = 3.0
+    soft = np.exp(-dist / tau)   
+    acc8 = cv2.normalize(acc, None, 0, 1, cv2.NORM_MINMAX)
+    soft = 0.7*soft + 0.3*acc8
+    soft = np.clip(soft, 0, 1)
+    return (soft * 255).astype(np.uint8)
+
+def build_4ch_CHW_from_bgr_dtedge(
+    bgr: np.ndarray,
+    sigmas=(0, 0.8, 1.6, 3.2),
+    **kwargs
+) -> np.ndarray:
+    """(4,H,W) = [R,G,B, DT-Edge]"""
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB).astype(np.uint8)
+    dt  = dt_edge_channel_from_bgr(bgr, sigmas=sigmas, **kwargs)
+    four = np.dstack([rgb, dt]).astype(np.uint8)
+    return four.transpose(2, 0, 1).copy()
+
+
 if __name__ == "__main__":
     
     image_dir = "datasets/GeoMap/images/train"
@@ -562,33 +773,44 @@ if __name__ == "__main__":
             DATA_YAML = "datasets/GeoMap/data.yaml"
     
     elif CHANNELS == 4:
-        print("[INFO] Converting cropped(+aug) to 4-channel multi-page TIFFs...")
-        tr_paths = convert_folder_to_4ch_tiff(output_image_dir, out_img4_train)
-        va_paths = convert_folder_to_4ch_tiff(val_output_image_dir, out_img4_val)
-        # mirror labels by stem
-        tr_stems = [os.path.splitext(os.path.basename(p))[0] for p in tr_paths]
-        va_stems = [os.path.splitext(os.path.basename(p))[0] for p in va_paths]
-        mirror_labels_by_stem(output_label_dir, out_lbl4_train, tr_stems)
-        mirror_labels_by_stem(val_output_label_dir, out_lbl4_val, va_stems)
-        # write train/val lists
-        with open(train_list_4ch, "w") as f:
-            for p in tr_paths: f.write(p + "\n")
-        with open(val_list_4ch, "w") as f:
-            for p in va_paths: f.write(p + "\n")
-        DATA_YAML = "datasets/GeoMap/data4ch.yaml"  # create yaml that points to cropped4/images/{train,val}
+        if APPLY_FILTERED_RGB:
+            MS_SIGMAS = (0, 0.6, 1.2, 2.4)
+            print("[INFO] Converting TRAIN to 4ch [RGB, DT-Edge] TIFFs...")
+            tr_paths = convert_folder_to_4ch_tiff_dtedge(
+                output_image_dir, out_img4_train,
+                sigmas=MS_SIGMAS, bin_method="percentile", p_hi=90, p_lo=65, morph_open=1
+            )
+            print("[INFO] Converting VAL to 4ch [RGB, DT-Edge] TIFFs...")
+            va_paths = convert_folder_to_4ch_tiff_dtedge(
+                val_output_image_dir, out_img4_val,
+                sigmas=MS_SIGMAS, bin_method="percentile", p_hi=90, p_lo=65, morph_open=1
+            )
+    
+            tr_stems = [os.path.splitext(os.path.basename(p))[0] for p in tr_paths]
+            va_stems = [os.path.splitext(os.path.basename(p))[0] for p in va_paths]
+            mirror_labels_by_stem(output_label_dir, out_lbl4_train, tr_stems)
+            mirror_labels_by_stem(val_output_label_dir, out_lbl4_val, va_stems)
+    
+            with open(train_list_4ch, "w") as f:
+                for p in tr_paths: f.write(p + "\n")
+            with open(val_list_4ch, "w") as f:
+                for p in va_paths: f.write(p + "\n")
+        
+            DATA_YAML = "datasets/GeoMap/data4ch.yaml"  # create yaml that points to cropped4/images/{train,val}
     
     elif CHANNELS == 6:
-        print("[INFO] Converting cropped(+aug) to 6-channel multi-page TIFFs...")
-        tr_paths = convert_folder_to_6ch_tiff(output_image_dir, out_img6_train)
-        va_paths = convert_folder_to_6ch_tiff(val_output_image_dir, out_img6_val)
-        tr_stems = [os.path.splitext(os.path.basename(p))[0] for p in tr_paths]
-        va_stems = [os.path.splitext(os.path.basename(p))[0] for p in va_paths]
-        mirror_labels_by_stem(output_label_dir, out_lbl6_train, tr_stems)
-        mirror_labels_by_stem(val_output_label_dir, out_lbl6_val, va_stems)
-        with open(train_list_6ch, "w") as f:
-            for p in tr_paths: f.write(p + "\n")
-        with open(val_list_6ch, "w") as f:
-            for p in va_paths: f.write(p + "\n")
+        if APPLY_FILTERED_RGB:
+            print("[INFO] Converting cropped(+aug) to 6-channel multi-page TIFFs...")
+            tr_paths = convert_folder_to_6ch_tiff(output_image_dir, out_img6_train)
+            va_paths = convert_folder_to_6ch_tiff(val_output_image_dir, out_img6_val)
+            tr_stems = [os.path.splitext(os.path.basename(p))[0] for p in tr_paths]
+            va_stems = [os.path.splitext(os.path.basename(p))[0] for p in va_paths]
+            mirror_labels_by_stem(output_label_dir, out_lbl6_train, tr_stems)
+            mirror_labels_by_stem(val_output_label_dir, out_lbl6_val, va_stems)
+            with open(train_list_6ch, "w") as f:
+                for p in tr_paths: f.write(p + "\n")
+            with open(val_list_6ch, "w") as f:
+                for p in va_paths: f.write(p + "\n")
         DATA_YAML = "datasets/GeoMap/data6ch.yaml"  # create yaml that points to cropped6/images/{train,val}
     
     else:
@@ -606,13 +828,13 @@ if __name__ == "__main__":
         cache=CACHE,
         rect=RECT,
         device=DEVICE,
-        multi_scale=False,
+        multi_scale=True,
         lr0=0.005,
         lrf=0.05,
         weight_decay=0.001,
         dropout=0.2,
         patience=10000,
-        plots=False,              
+        plots=True,              
         overlap_mask=False,
         # task='obb',
         # mosaic=0.0, mixup=0.0, copy_paste=0.0,
