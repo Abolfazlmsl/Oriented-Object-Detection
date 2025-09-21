@@ -20,8 +20,18 @@ from ultralytics.models.yolo.obb.predict import OBBPredictor
 # =========================
 # Config
 # =========================
-channels = 4         # set to 3, 4, or 6 
+channels = 3         # set to 3, 4, or 6 
 APPLY_FILTER_3CH = False  
+FOURCH_MODE = "dtedge"   # "dtedge" | "msedge" | "Lproc" | "palette_per_image"
+MS_SIGMAS = (0, 0.6, 1.2, 2.4)
+DT_BIN_METHOD = "otsu"  
+DT_P_HI, DT_P_LO = 90, 65
+DT_MORPH_OPEN = 1
+PALETTE_K = 15                      
+PALETTE_SAMPLE_DOWN = 2           
+KMEANS_MAX_ITER = 20
+KMEANS_EPS = 1.0
+KMEANS_ATTEMPTS = 1
 
 USM_RADIUS = 7.0
 USM_WEIGHT = 1.40
@@ -232,14 +242,32 @@ def build_multich(bgr: np.ndarray, out_channels: int = channels) -> np.ndarray:
             multich = rgb_raw
 
     elif out_channels == 4:
-        # L_proc = NLM( Unsharp(L in LAB) )
-        lab32 = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
-        L, A, B = cv2.split(lab32)
-        L_blur  = cv2.GaussianBlur(L, (0, 0), sigmaX=USM_RADIUS, sigmaY=USM_RADIUS, borderType=cv2.BORDER_REFLECT_101)
-        L_sharp = np.clip(L + USM_WEIGHT * (L - L_blur), 0, 255).astype(np.uint8)
-        L_proc  = cv2.fastNlMeansDenoising(L_sharp, None, h=NLM_H, templateWindowSize=NLM_T, searchWindowSize=NLM_S)
-        multich = np.dstack([rgb_raw, L_proc]).astype(np.uint8)  # (H,W,4)
-
+        if FOURCH_MODE == "dtedge":
+            rgb  = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            dt   = dt_edge_channel_from_bgr(
+                      bgr,
+                      sigmas=MS_SIGMAS,
+                      bin_method=DT_BIN_METHOD,
+                      p_hi=DT_P_HI, p_lo=DT_P_LO,
+                      morph_open=DT_MORPH_OPEN
+                  )
+            multich = np.dstack([rgb, dt]).astype(np.uint8)
+    
+        elif FOURCH_MODE == "msedge":
+            rgb  = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            edge = ms_edge_channel_from_bgr(bgr, sigmas=MS_SIGMAS)
+            multich = np.dstack([rgb, edge]).astype(np.uint8)
+    
+        elif FOURCH_MODE == "palette_per_image":
+            multich = _build_4ch_rgb_plus_index_per_image(bgr, K=PALETTE_K)
+        else:  # "Lproc"
+            lab32 = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+            L, A, B = cv2.split(lab32)
+            L_blur  = cv2.GaussianBlur(L, (0, 0), sigmaX=USM_RADIUS, sigmaY=USM_RADIUS, borderType=cv2.BORDER_REFLECT_101)
+            L_sharp = np.clip(L + USM_WEIGHT * (L - L_blur), 0, 255).astype(np.uint8)
+            L_proc  = cv2.fastNlMeansDenoising(L_sharp, None, h=NLM_H, templateWindowSize=NLM_T, searchWindowSize=NLM_S)
+            multich = np.dstack([cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB), L_proc]).astype(np.uint8)
+    
     else:  # out_channels == 6
         bgr_usm  = _unsharp_imagej(bgr, radius=USM_RADIUS, weight=USM_WEIGHT)
         rgb_proc = _nlm_rgb_to_rgb(bgr_usm, h=NLM_H, t=NLM_T, s=NLM_S)  # (H,W,3) uint8
@@ -247,6 +275,88 @@ def build_multich(bgr: np.ndarray, out_channels: int = channels) -> np.ndarray:
 
     return np.ascontiguousarray(multich)
 
+def _index_per_image_kmeans(bgr: np.ndarray, K=PALETTE_K, sample_down=PALETTE_SAMPLE_DOWN) -> np.ndarray:
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    if sample_down > 1:
+        small = cv2.resize(rgb, (rgb.shape[1] // sample_down, rgb.shape[0] // sample_down),
+                           interpolation=cv2.INTER_AREA)
+    else:
+        small = rgb
+    Z = small.reshape(-1, 3).astype(np.float32)
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, KMEANS_MAX_ITER, KMEANS_EPS)
+    _compactness, labels_small, centers = cv2.kmeans(
+        Z, K, None, criteria, KMEANS_ATTEMPTS, cv2.KMEANS_PP_CENTERS
+    )
+    centers = centers.astype(np.float32)  # (K,3) RGB
+
+    flat = rgb.reshape(-1, 3).astype(np.float32)
+    dists = ((flat[:, None, :] - centers[None, :, :]) ** 2).sum(axis=2)  # (N,K)
+    labels = np.argmin(dists, axis=1).astype(np.uint8)
+    return labels.reshape(rgb.shape[:2])  # (H,W) uint8
+
+def _build_4ch_rgb_plus_index_per_image(bgr: np.ndarray, K=PALETTE_K) -> np.ndarray:
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB).astype(np.uint8)
+    idx = _index_per_image_kmeans(bgr, K=K)  # (H,W) uint8
+    return np.dstack([rgb, idx])
+
+def _grad_mag(gray: np.ndarray) -> np.ndarray:
+    gx = cv2.Scharr(gray, cv2.CV_32F, 1, 0)
+    gy = cv2.Scharr(gray, cv2.CV_32F, 0, 1)
+    return cv2.magnitude(gx, gy)
+
+def ms_edge_channel_from_bgr(bgr: np.ndarray, sigmas=MS_SIGMAS) -> np.uint8:
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    acc = None
+    for s in sigmas:
+        blur = cv2.GaussianBlur(gray, (0, 0), s, s, borderType=cv2.BORDER_REFLECT_101) if s > 0 else gray
+        mag  = _grad_mag(blur)
+        acc  = mag if acc is None else np.maximum(acc, mag)
+    lo, hi = np.percentile(acc, [1, 99])
+    acc = np.clip((acc - lo) / max(1e-6, (hi - lo)), 0, 1)
+    return (acc * 255).astype(np.uint8)
+
+def _scharr_mag(gray: np.ndarray) -> np.ndarray:
+    gx = cv2.Scharr(gray, cv2.CV_32F, 1, 0)
+    gy = cv2.Scharr(gray, cv2.CV_32F, 0, 1)
+    return cv2.magnitude(gx, gy)
+
+def dt_edge_channel_from_bgr(
+    bgr: np.ndarray,
+    sigmas=MS_SIGMAS,
+    bin_method: str = DT_BIN_METHOD,
+    p_hi: int = DT_P_HI, p_lo: int = DT_P_LO,
+    morph_open: int = DT_MORPH_OPEN
+) -> np.uint8:
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    acc = None
+    for s in sigmas:
+        blur = cv2.GaussianBlur(gray, (0,0), s, s, borderType=cv2.BORDER_REFLECT_101) if s>0 else gray
+        mag  = _scharr_mag(blur)
+        acc  = mag if acc is None else np.maximum(acc, mag)
+
+    if bin_method == "otsu":
+        acc8 = cv2.normalize(acc, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        _, edges = cv2.threshold(acc8, 0, 255, cv2.THRESH_BINARY+cv2.THRESH_OTSU)
+    else:
+        lo, hi = np.percentile(acc, [p_lo, p_hi])
+        edges = (acc >= hi).astype(np.uint8) * 255
+
+    if morph_open > 0:
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3,3))
+        edges = cv2.morphologyEx(edges, cv2.MORPH_OPEN, k, iterations=morph_open)
+
+    non_edge = cv2.threshold(edges, 0, 255, cv2.THRESH_BINARY_INV)[1]
+    dist = cv2.distanceTransform(non_edge, cv2.DIST_L2, 3).astype(np.float32)
+
+    lo, hi = np.percentile(dist, [1, 99])
+    dist = np.clip((dist - lo) / max(1e-6, (hi - lo)), 0, 1)
+    tau = 3.0  
+    soft = np.exp(-dist / tau)          
+
+    acc8 = cv2.normalize(acc, None, 0, 1, cv2.NORM_MINMAX)
+    soft = 0.7 * soft + 0.3 * acc8
+    soft = np.clip(soft, 0, 1)
+    return (soft * 255).astype(np.uint8)
 
 # =========================
 # Utils
@@ -503,6 +613,7 @@ def run_fusion_eval(input_dir, iou_thr=0.5):
         print("[Eval] No images found for evaluation.")
         return
 
+    print(f"Channels: {channels}, APPLY_FILTER_3CH: {APPLY_FILTER_3CH}")
     print(f"Tile size: {tile_sizes}, Overlap: {overlaps}")    
     best = _find_best_conf_threshold(all_images, iou_thr=iou_thr)
     print(f"[Fusion] Best confidence threshold (by F1): {best['thr']:.2f} | P={best['P']:.3f} R={best['R']:.3f} F1={best['F1']:.3f}")

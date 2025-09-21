@@ -11,25 +11,19 @@ import os
 from ultralytics import YOLO
 import numpy as np
 import pandas as pd
-from shapely.geometry import Polygon
+from shapely.geometry import Polygon, Point
 import time
 
 start_time = time.time()
 
-NMS_IOU = 0.2
-iou_threshold = 0.5
-EVAL_IOU_THRS = [round(x, 2) for x in np.arange(0.50, 1.00, 0.05)] 
-CONF_MIN = 0.001        
-MAX_DETS_PER_IMAGE = 1000 
-
 calculate_metrics = True
-tile_sizes = [128]
-overlaps = [20]
-models = [YOLO("best128.pt")]
-
-input_dir = "Input"
-output_dir = "Output"
-os.makedirs(output_dir, exist_ok=True)
+MAP_MIN_SCORE = 0.001                   
+IOU_LIST_FOR_MAP = [0.5] + [round(0.5 + 0.05*i, 2) for i in range(1, 10)] 
+tile_sizes = [128, 416]
+overlaps = [20, 50]
+iou_threshold = 0.2 # Representation
+iou_thr = 0.2 # Metric
+models = [YOLO("best128.pt"), YOLO("best416.pt")]
 
 # Define colors for different classes
 CLASS_COLORS = {
@@ -70,8 +64,7 @@ CLASS_NAMES = {
 
 # Add threshold for each class
 if calculate_metrics:
-    BASE_EVAL_THR = 0
-    CLASS_THRESHOLDS = {cid: BASE_EVAL_THR for cid in CLASS_NAMES.keys()}
+    CLASS_THRESHOLDS = {i: 0.25 for i in CLASS_NAMES.keys()}
 else:
     CLASS_THRESHOLDS = {
         0: 0.6,  # Landslide 1
@@ -91,7 +84,7 @@ else:
     }
     
 # Classes to exclude completely (will not be shown on the image)
-EXCLUDED_CLASSES = {} if calculate_metrics else {12, 13}
+EXCLUDED_CLASSES = {12, 13}
 
 all_dets_per_image = {}  
 
@@ -145,6 +138,12 @@ def compute_polygon_iou(box1, box2):
     union = poly1.area + poly2.area - intersection
     return intersection / union if union > 0 else 0.0
 
+def _center_of_poly8(poly8):
+    # poly8: [x1,y1,x2,y2,x3,y3,x4,y4]
+    xs = poly8[0::2]; ys = poly8[1::2]
+    return (sum(xs) / 4.0, sum(ys) / 4.0)
+
+
 def detect_symbols(image, model, tile_size, overlap):
     """
     Detect objects in an image using a given model, tile size, and overlap.
@@ -156,8 +155,8 @@ def detect_symbols(image, model, tile_size, overlap):
         for x in range(0, w, step):
             crop_detections = []
             crop = image[y:y + tile_size, x:x + tile_size]
-            if crop.shape[0] != tile_size or crop.shape[1] != tile_size:
-                continue
+            # if crop.shape[0] != tile_size or crop.shape[1] != tile_size:
+            #     continue
             # crop_gray = convert_bgr_to_rgb(crop)
             results = model(crop)
             for box in results[0].obb:
@@ -174,7 +173,7 @@ def detect_symbols(image, model, tile_size, overlap):
                     angle = 0
                 crop_detections.append((x1 + x, y1 + y, x2 + x, y2 + y, x3 + x, y3 + y,\
                                         x4 + x, y4 + y, cls, conf, angle))
-            detections.extend(merge_detections(crop_detections, NMS_IOU))
+            detections.extend(merge_detections(crop_detections, iou_threshold))
                     
     return detections
 
@@ -243,9 +242,7 @@ def process_image(image_path, output_dir):
     
     print("--- %s seconds ---" % (time.time() - start_time))
     
-    merged_detections = merge_detections(all_detections, NMS_IOU, False)
-    merged_detections.sort(key=lambda d: d[9], reverse=True)
-    merged_detections = merged_detections[:MAX_DETS_PER_IMAGE]
+    merged_detections = merge_detections(all_detections, iou_threshold, False)
     result_image = image.copy()
     image_name = os.path.basename(image_path)
     excel_path = os.path.join(output_dir, image_name.replace(".jpg", ".xlsx").replace(".png", ".xlsx"))
@@ -324,7 +321,7 @@ def _load_gt_as_pixels(image_path):
             gts.append({"cls": cls_id, "pts": pts_pix})
     return gts
 
-def _match_dets_to_gts_pixel(dets, gts, iou_thr=0.5):
+def _match_dets_to_gts_pixel(dets, gts, iou_thr):
     """
     dets: list of tuples (x1..y4, cls, conf, angle) in pixels
     gts:  list of dicts {"cls": int, "pts": [(x,y)*4]} in pixels
@@ -356,7 +353,7 @@ def _prec_rec_f1(tp, fp, fn):
     F1 = 2 * P * R / (P + R + 1e-9)
     return P, R, F1
 
-def _evaluate_dataset(all_images, conf_thr=0.25, iou_thr=0.5):
+def _evaluate_dataset(all_images, conf_thr, iou_thr):
     tot_tp = tot_fp = tot_fn = 0
     for img_path in all_images:
         dets_all = all_dets_per_image.get(img_path, [])
@@ -365,6 +362,10 @@ def _evaluate_dataset(all_images, conf_thr=0.25, iou_thr=0.5):
         except NameError:
             filtered = [d for d in dets_all if d[9] >= conf_thr]
         gts = _load_gt_as_pixels(img_path)
+        try:
+            gts = [g for g in gts if g["cls"] not in EXCLUDED_CLASSES]
+        except NameError:
+            pass
         tp, fp, fn = _match_dets_to_gts_pixel(filtered, gts, iou_thr=iou_thr)
         tot_tp += tp; tot_fp += fp; tot_fn += fn
     return _prec_rec_f1(tot_tp, tot_fp, tot_fn)
@@ -377,7 +378,7 @@ def _find_best_conf_threshold(all_images, iou_thr=0.5):
             best = {"thr": float(thr), "P": float(P), "R": float(R), "F1": float(F1)}
     return best
 
-def _classwise_report(all_images, conf_thr=0.25, iou_thr=0.5):
+def _classwise_report(all_images, conf_thr, iou_thr):
     rows = []
     all_cids = set()
     for dets in all_dets_per_image.values():
@@ -420,160 +421,214 @@ def _classwise_report(all_images, conf_thr=0.25, iou_thr=0.5):
         print(f"[Saved] {out_path}")
         return df
 
-def _gather_dets_gts_by_class(all_images, conf_min=0.001):
-    dets_by_cls = {}
-    gts_by_cls  = {}
+# ---- New: functions to compute AP / mAP across IoU thresholds ----
+def compute_ap_from_pr(recall, precision):
+    """
+    Compute AP as area under precision-recall curve using trapezoidal rule.
+    recall and precision arrays must be sorted increasing recall.
+    """
+    # ensure monotonic precision envelope (common VOC/COCO step)
+    # For stability, append endpoints
+    mrec = np.concatenate(([0.0], recall, [1.0]))
+    mpre = np.concatenate(([0.0], precision, [0.0]))
+    # make precision monotonically decreasing
+    for i in range(mpre.size-2, -1, -1):
+        mpre[i] = max(mpre[i], mpre[i+1])
+    # compute area
+    idx = np.where(mrec[1:] != mrec[:-1])[0]
+    ap = np.sum((mrec[idx+1] - mrec[idx]) * mpre[idx+1])
+    return ap
+
+def gather_detections_and_gts(all_images, cls_id):
+    try:
+        if cls_id in EXCLUDED_CLASSES:
+            return [], {}
+    except NameError:
+        pass
+
+    dets, gts = [], {}
     for img_path in all_images:
-        dets_all = all_dets_per_image.get(img_path, [])
-        dets_all = [d for d in dets_all if d[9] >= conf_min]
-        gts = _load_gt_as_pixels(img_path)
-        for g in gts:
-            cid = int(g["cls"])
-            gts_by_cls.setdefault(cid, {}).setdefault(img_path, []).append(
-                {"poly": [coord for pt in g["pts"] for coord in pt], "used": False}
-            )
-        for d in dets_all:
-            cid = int(d[8]); sc = float(d[9]); poly = d[:8]
-            dets_by_cls.setdefault(cid, []).append(
-                {"image": img_path, "score": sc, "poly": poly, "matched": False}
-            )
-    return dets_by_cls, gts_by_cls
+        img_dets_all = all_dets_per_image.get(img_path, [])
+
+        img_dets_cls = [d for d in img_dets_all if int(d[8]) == cls_id]
+
+        for d in img_dets_cls:
+            if d[9] >= MAP_MIN_SCORE:
+                dets.append({"image_id": img_path, "score": float(d[9]), "bbox": d[:8]})
+
+        gt_boxes = _load_gt_as_pixels(img_path)
+        gts[img_path] = [[c for pt in g["pts"] for c in pt] for g in gt_boxes if g["cls"] == cls_id]
+
+    return dets, gts
 
 
-def _pr_curve_for_class(dets, gts_per_img, iou_thr):
-    if len(dets) == 0:
-        return np.array([0.0]), np.array([0.0]), 0.0
-    dets = sorted(dets, key=lambda x: x["score"], reverse=True)
-    tp = np.zeros(len(dets)); fp = np.zeros(len(dets))
-    for i, det in enumerate(dets):
-        img = det["image"]
-        cand = gts_per_img.get(img, [])
-        best_iou, best_j = 0.0, -1
-        for j, g in enumerate(cand):
-            if g["used"]:
+
+def compute_pr_for_class(dets, gts, iou_thr=0.5):
+    """
+    dets: list of {'image_id','score','bbox'}
+    gts: dict image_id -> list of gt bboxes (list of 8 coords)
+    returns: precision array, recall array, ap
+    """
+    # count total positives
+    npos = sum(len(v) for v in gts.values())
+    if npos == 0:
+        return np.array([0.0]), np.array([0.0]), None
+    # sort detections by score desc
+    dets_sorted = sorted(dets, key=lambda x: x["score"], reverse=True)
+    tp = np.zeros(len(dets_sorted))
+    fp = np.zeros(len(dets_sorted))
+    # keep track of matched GTs per image
+    matched = {img: np.zeros(len(gts.get(img,[])), dtype=bool) for img in gts.keys()}
+    for i, det in enumerate(dets_sorted):
+        img = det["image_id"]
+        box_det = det["bbox"]
+        best_iou = 0.0
+        best_j = -1
+        gt_list = gts.get(img, [])
+        for j, gt_box in enumerate(gt_list):
+            if matched[img][j]:
                 continue
-            iou = compute_polygon_iou(det["poly"], g["poly"])
+            iou = compute_polygon_iou(box_det, gt_box)
             if iou > best_iou:
-                best_iou, best_j = iou, j
-        if best_iou >= iou_thr and best_j >= 0:
-            cand[best_j]["used"] = True
-            tp[i] = 1.0
+                best_iou = iou
+                best_j = j
+        if best_iou >= iou_thr:
+            tp[i] = 1
+            matched[img][best_j] = True
         else:
-            fp[i] = 1.0
+            fp[i] = 1
+    # cumulative
     tp_cum = np.cumsum(tp)
     fp_cum = np.cumsum(fp)
-    recalls = tp_cum / (sum(len(v) for v in gts_per_img.values()) + 1e-9)
-    precisions = tp_cum / (tp_cum + fp_cum + 1e-9)
-    mrec = np.concatenate(([0.0], recalls, [1.0]))
-    mpre = np.concatenate(([0.0], precisions, [0.0]))
-    for k in range(mpre.size - 1, 0, -1):
-        mpre[k - 1] = max(mpre[k - 1], mpre[k])
-    idx = np.where(mrec[1:] != mrec[:-1])[0]
-    ap = np.sum((mrec[idx + 1] - mrec[idx]) * mpre[idx + 1])
-    return precisions, recalls, ap
+    recall = tp_cum / (npos + 1e-9)
+    precision = tp_cum / (tp_cum + fp_cum + 1e-9)
+    ap = compute_ap_from_pr(recall, precision)
+    return precision, recall, ap
 
+def _gt_class_ids(all_images):
+    s = set()
+    for img in all_images:
+        for g in _load_gt_as_pixels(img):
+            s.add(int(g["cls"]))
+    try:
+        s = {cid for cid in s if cid not in EXCLUDED_CLASSES}
+    except NameError:
+        pass
+    return sorted(s)
 
-def evaluate_map(all_images, iou_thrs, conf_min=0.001):
-    dets_by_cls, gts_by_cls = _gather_dets_gts_by_class(all_images, conf_min=conf_min)
-    classes = sorted(set(list(dets_by_cls.keys()) + list(gts_by_cls.keys())))
-    ap_table = []
-    ap_per_thr = {thr: [] for thr in iou_thrs}
-    for cid in classes:
-        aps_cls = []
-        for thr in iou_thrs:
-            gts_copy = {img: [{"poly": g["poly"], "used": False} for g in lst]
-                        for img, lst in gts_by_cls.get(cid, {}).items()}
-            dets = dets_by_cls.get(cid, [])
-            _, _, ap = _pr_curve_for_class(dets, gts_copy, thr)
-            aps_cls.append(ap)
-            ap_per_thr[thr].append(ap)
-        ap_table.append([cid] + aps_cls + [float(np.mean(aps_cls))])
-    map_5095 = float(np.mean([np.mean(v) if len(v)>0 else 0.0 for v in ap_per_thr.values()]))
-    map_50   = float(np.mean(ap_per_thr.get(0.50, [0.0])))
-    map_75   = float(np.mean(ap_per_thr.get(0.75, [0.0])))
-    return {
-        "classes": classes,
-        "AP_table": ap_table,
-        "mAP_50_95": map_5095,
-        "mAP_50": map_50,
-        "mAP_75": map_75
-    }
+def evaluate_map(all_images, iou_list=None):
+    """
+    Compute mAP for all classes across IoU thresholds in iou_list.
+    By default calculates mAP@0.5 and mAP@[0.5:0.95]
+    """
+    if iou_list is None:
+        iou_list = IOU_LIST_FOR_MAP
+    # class_ids = sorted({int(d[8]) for dets in all_dets_per_image.values() for d in dets if int(d[8]) not in EXCLUDED_CLASSES})
+    class_ids = _gt_class_ids(all_images)
+    per_iou_map = {}
+    # for each IoU threshold compute AP per class
+    for iou in iou_list:
+        ap_list = []
+        for cid in class_ids:
+            dets, gts = gather_detections_and_gts(all_images, cid)
+            precision, recall, ap = compute_pr_for_class(dets, gts, iou_thr=iou)
+            if ap is not None:              
+                ap_list.append(ap)
+        per_iou_map[iou] = float(np.mean(ap_list)) if ap_list else 0.0
+    map50 = per_iou_map.get(0.5, 0.0)
+    map5095 = float(np.mean([per_iou_map[i] for i in iou_list])) if iou_list else 0.0
+    return {"mAP@0.5": map50, "mAP@[0.5:0.95]": map5095, "per_iou": per_iou_map}
 
-def _evaluate_dataset_with_conf(all_images, conf_thr=0.5, iou_thr=0.5):
-    TP = FP = FN = 0
+def evaluate_center_hit(all_images, conf_thr=0.5):
+    """
+    Center-Hit metric: a detection is TP if its center falls inside a GT polygon of the same class.
+    Uses EXCLUDED_CLASSES just like other metrics.
+    Returns (P, R, F1) and prints a summary.
+    """
+    tp = fp = fn = 0
+
     for img_path in all_images:
-        # predicted detections for this image
-        dets = all_dets_per_image.get(img_path, [])
-        dets = [d for d in dets if float(d[9]) >= conf_thr]  # [x1..x8, cls, conf]
+        # detections (apply conf threshold, ignore excluded classes)
+        dets = [d for d in all_dets_per_image.get(img_path, [])
+                if (d[9] >= conf_thr and int(d[8]) not in EXCLUDED_CLASSES)]
 
-        # group by class
-        dets_by_cls = {}
+        # ground truths (ignore excluded classes)
+        gts = [g for g in _load_gt_as_pixels(img_path) if g["cls"] not in EXCLUDED_CLASSES]
+
+        used = [False] * len(gts)  # each GT can be matched at most once
+
         for d in dets:
-            cid = int(d[8])
-            dets_by_cls.setdefault(cid, []).append(d[:8])
+            cls = int(d[8])
+            cx, cy = _center_of_poly8(d[:8])
+            p_center = Point(cx, cy)
 
-        # load GTs (each: {"cls": int, "pts": [(x,y)*4]})
-        gts = _load_gt_as_pixels(img_path)
-        gts_by_cls = {}
-        for g in gts:
-            cid = int(g["cls"])
-            poly = [coord for pt in g["pts"] for coord in pt]
-            gts_by_cls.setdefault(cid, []).append({"poly": poly, "used": False})
+            matched = False
+            for j, g in enumerate(gts):
+                if used[j] or g["cls"] != cls:
+                    continue
+                poly = Polygon(g["pts"])
+                if not poly.is_valid:
+                    continue
+                if poly.contains(p_center):
+                    tp += 1
+                    used[j] = True
+                    matched = True
+                    break
 
-        # match per class
-        classes = set(list(dets_by_cls.keys()) + list(gts_by_cls.keys()))
-        for cid in classes:
-            preds = dets_by_cls.get(cid, [])
-            gts_c = gts_by_cls.get(cid, [])
-            # greedy matching on score order is already applied before; here order is arbitrary but fine
-            matched = 0
-            used_idx = set()
-            for p in preds:
-                best_iou, best_j = 0.0, -1
-                for j, g in enumerate(gts_c):
-                    if g["used"]:
-                        continue
-                    iou = compute_polygon_iou(p, g["poly"])
-                    if iou > best_iou:
-                        best_iou, best_j = iou, j
-                if best_iou >= iou_thr and best_j >= 0:
-                    gts_c[best_j]["used"] = True
-                    matched += 1
-            TP += matched
-            FP += max(0, len(preds) - matched)
-            FN += sum(1 for g in gts_c if not g["used"])
+            if not matched:
+                fp += 1
 
-    TN = 0  # not defined for object detection; kept as 0
-    return TP, FP, TN, FN
+        # any GTs left unmatched are FNs
+        fn += sum(1 for u in used if not u)
+
+    P, R, F1 = _prec_rec_f1(tp, fp, fn)
+    print(f"[Center-Hit @ conf≥{conf_thr:.2f}] P={P:.3f} R={R:.3f} F1={F1:.3f} (TP={tp}, FP={fp}, FN={fn})")
+    return P, R, F1
 
 
-def _report_prf1_acc_from_counts(TP, FP, TN, FN):
-    P = TP / (TP + FP + 1e-9)
-    R = TP / (TP + FN + 1e-9)
-    F1 = 2 * P * R / (P + R + 1e-9)
-    # "Accuracy" for detection (without TN):
-    Acc = TP / (TP + FP + FN + 1e-9)
-    return P, R, F1, Acc
-
-def run_fusion_eval(input_dir, iou_thr=0.5):
+def run_fusion_eval(input_dir, iou_thr):
     all_images = [os.path.join(input_dir, f) for f in os.listdir(input_dir)
                   if f.lower().endswith(('.png','.jpg','.jpeg','.tif','.tiff'))]
     if not all_images:
         print("[Eval] No images found for evaluation.")
         return
 
-    print(f"Tile size: {tile_sizes}, Overlap: {overlaps}")
-    
-    res = evaluate_map(all_images, EVAL_IOU_THRS, conf_min=CONF_MIN)
-    print(f"[mAP] mAP@[.5:.95]={res['mAP_50_95']:.3f} | AP50={res['mAP_50']:.3f} | AP75={res['mAP_75']:.3f}")
-    
+    print(f"Tile size: {tile_sizes}, Overlap: {overlaps}")    
     best = _find_best_conf_threshold(all_images, iou_thr=iou_thr)
-    conf_thr = best['thr'] if isinstance(best, dict) and 'thr' in best else 0.5
-    TP, FP, TN, FN = _evaluate_dataset_with_conf(all_images, conf_thr=conf_thr, iou_thr=iou_thr)
-    P, R, F1, Acc = _report_prf1_acc_from_counts(TP, FP, TN, FN)
-    print(f"[Fixed-Threshold @ {conf_thr:.2f}] "
-          f"Precision={P:.3f} | Recall={R:.3f} | F1={F1:.3f} | Accuracy={Acc:.3f} "
-          f"(TP={TP}, FP={FP}, FN={FN})")
+    print(f"[Fusion] Best confidence threshold (by F1): {best['thr']:.2f} | P={best['P']:.3f} R={best['R']:.3f} F1={best['F1']:.3f}")
+    P, R, F1 = _evaluate_dataset(all_images, conf_thr=best['thr'], iou_thr=iou_thr)
+    print(f"[Fusion @ {best['thr']:.2f}] Precision={P:.3f} | Recall={R:.3f} | F1={F1:.3f}")
+    _classwise_report(all_images, conf_thr=best['thr'], iou_thr=iou_thr)
+    evaluate_center_hit(all_images, conf_thr=best['thr'])
+    # compute mAPs
+    maps = evaluate_map(all_images, iou_list=list(np.arange(0.5, 0.96, 0.05)))
+    print("[mAP Results]")
+    print(f"mAP@0.5 = {maps['mAP@0.5']:.4f}")
+    print(f"mAP@[0.5:0.95] = {maps['mAP@[0.5:0.95]']:.4f}")
+    
+    maps_soft = evaluate_map(all_images, iou_list=[0.30, 0.40, 0.50, 0.60, 0.70])
+    print("[mAP (soft) Results]")
+    print(f"mAP@0.3 = {maps_soft['per_iou'][0.30]:.4f}")
+    soft_avg = float(np.mean([maps_soft['per_iou'][i] for i in [0.30,0.40,0.50,0.60,0.70]]))
+    print(f"mAP@[0.3:0.7] = {soft_avg:.4f}")
+    
+    # save per-IoU mAP
+    try:
+        save_dir = output_dir
+    except NameError:
+        save_dir = "."
+    per_iou_rows = [{"iou": k, "mAP": v} for k, v in maps["per_iou"].items()]
+    pd.DataFrame(per_iou_rows).to_excel(os.path.join(save_dir, "fusion_map_per_iou.xlsx"), index=False)
+    print(f"[Saved] mAP per IoU table to {os.path.join(save_dir, 'fusion_map_per_iou.xlsx')}")
+    
+    soft_rows = [{"iou": k, "mAP": v} for k, v in maps_soft["per_iou"].items()]
+    pd.DataFrame(soft_rows).to_excel(os.path.join(save_dir, "fusion_map_per_iou_soft.xlsx"), index=False)
+    print(f"[Saved] soft mAP per IoU table to {os.path.join(save_dir, 'fusion_map_per_iou_soft.xlsx')}")
+    
+
+input_dir = "Input"
+output_dir = "Output"
+os.makedirs(output_dir, exist_ok=True)
 
 for image_file in os.listdir(input_dir):
     if image_file.lower().endswith((".png", ".jpg", ".jpeg")):
@@ -585,6 +640,6 @@ print("--- %s seconds ---" % (time.time() - start_time))
 
 if calculate_metrics:
     try:
-        run_fusion_eval(input_dir, iou_thr=iou_threshold)
+        run_fusion_eval(input_dir, iou_thr=iou_thr)
     except Exception as e:
         print(f"[Eval] Skipped due to error: {e}")
