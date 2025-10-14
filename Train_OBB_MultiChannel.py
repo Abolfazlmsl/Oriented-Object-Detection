@@ -23,10 +23,10 @@ APPLY_FILTERED_RGB = False
 need_cropping = False 
 need_augmentation = False
 Dual_GPU = True
-TILE_SIZE = 128
-overlap = 50
+TILE_SIZE = 416
+overlap = 150
 EPOCHS = 150
-BATCH_SIZE = 32
+BATCH_SIZE = 16
 WORKERS = 2
 CACHE = False       
 RECT = False  
@@ -673,17 +673,17 @@ if __name__ == "__main__":
     
     image_dir = "datasets/GeoMap/images/train"
     label_dir = "datasets/GeoMap/labels/train"
-    output_image_dir = "datasets/GeoMap/cropped/images/train"
-    output_label_dir = "datasets/GeoMap/cropped/labels/train"
+    output_image_dir = f"datasets/GeoMap/cropped{TILE_SIZE}/images/train"
+    output_label_dir = f"datasets/GeoMap/cropped{TILE_SIZE}/labels/train"
     txt_file = "datasets/GeoMap/train.txt"
-    cropped_txt_file = "datasets/GeoMap/train_cropped.txt"
+    cropped_txt_file = f"datasets/GeoMap/train_cropped{TILE_SIZE}.txt"
 
     val_image_dir = "datasets/GeoMap/images/val"
     val_label_dir = "datasets/GeoMap/labels/val"
-    val_output_image_dir = "datasets/GeoMap/cropped/images/val"
-    val_output_label_dir = "datasets/GeoMap/cropped/labels/val"
+    val_output_image_dir = f"datasets/GeoMap/cropped{TILE_SIZE}/images/val"
+    val_output_label_dir = f"datasets/GeoMap/cropped{TILE_SIZE}/labels/val"
     val_txt_file = "datasets/GeoMap/val.txt"
-    val_cropped_txt_file = "datasets/GeoMap/val_cropped.txt"
+    val_cropped_txt_file = f"datasets/GeoMap/val_cropped{TILE_SIZE}.txt"
     
     # 4ch and 6ch output roots (parallel to cropped/)
     out_img4_train = "datasets/GeoMap/cropped4/images/train"
@@ -740,13 +740,13 @@ if __name__ == "__main__":
             augmentation_repeats=augmentation_repeats            
         )
 
-        balance_classes(
-            image_dir=val_output_image_dir,
-            label_dir=val_output_label_dir,
-            txt_file=val_cropped_txt_file,
-            class_balance_threshold=class_balance_threshold,
-            augmentation_repeats=augmentation_repeats 
-        )
+        # balance_classes(
+        #     image_dir=val_output_image_dir,
+        #     label_dir=val_output_label_dir,
+        #     txt_file=val_cropped_txt_file,
+        #     class_balance_threshold=class_balance_threshold,
+        #     augmentation_repeats=augmentation_repeats 
+        # )
 
     # ===== Build training/val inputs based on CHANNELS =====
     if CHANNELS == 3:
@@ -770,7 +770,7 @@ if __name__ == "__main__":
                 for p in val_filtered_paths: f.write(p + "\n")
             DATA_YAML = "datasets/GeoMap/data_filt.yaml"
         else:
-            DATA_YAML = "datasets/GeoMap/data.yaml"
+            DATA_YAML = f"datasets/GeoMap/data{TILE_SIZE}.yaml"
     
     elif CHANNELS == 4:
         if APPLY_FILTERED_RGB:
@@ -816,33 +816,9 @@ if __name__ == "__main__":
     else:
         raise ValueError("CHANNELS must be 3, 4, or 6")
     
-    model = YOLO("yolo11x-obb.pt")
+    model = YOLO("yolov8x-obb.pt")
     
-    # Size 128
-    model.train(
-        data=DATA_YAML,
-        epochs=EPOCHS,
-        imgsz=TILE_SIZE,
-        batch=BATCH_SIZE,
-        workers=WORKERS,
-        cache=CACHE,
-        rect=RECT,
-        device=DEVICE,
-        multi_scale=True,
-        lr0=0.005,
-        lrf=0.05,
-        weight_decay=0.001,
-        dropout=0.2,
-        patience=10000,
-        plots=True,              
-        overlap_mask=False,
-        # task='obb',
-        # mosaic=0.0, mixup=0.0, copy_paste=0.0,
-        # hsv_h=0.0, hsv_s=0.0, hsv_v=0.0,
-        # amp=False
-    )
-    
-    # # Size 416
+    # # Size 128
     # model.train(
     #     data=DATA_YAML,
     #     epochs=EPOCHS,
@@ -853,14 +829,38 @@ if __name__ == "__main__":
     #     rect=RECT,
     #     device=DEVICE,
     #     multi_scale=False,
-    #     lr0 = 0.002,  
-    #     lrf = 0.05,      
-    #     weight_decay = 0.001, 
-    #     dropout = 0.2,
-    #     # warmup_epochs = 5.0,
-    #     # warmup_momentum = 0.85,
-    #     # warmup_bias_lr = 0.08,
+    #     lr0=0.003,
+    #     lrf=0.05,
+    #     weight_decay=0.001,
+    #     dropout=0.0,
     #     patience=10000,
-    #     plots = False,
-    #     overlap_mask = False,
+    #     plots=True,              
+    #     overlap_mask=False,
+    #     # task='obb',
+    #     # mosaic=0.0, mixup=0.0, copy_paste=0.0,
+    #     # hsv_h=0.0, hsv_s=0.0, hsv_v=0.0,
+    #     # amp=False
     # )
+    
+    # Size 416
+    model.train(
+        data=DATA_YAML,
+        epochs=EPOCHS,
+        imgsz=TILE_SIZE,
+        batch=BATCH_SIZE,
+        workers=WORKERS,
+        cache=CACHE,
+        rect=RECT,
+        device=DEVICE,
+        multi_scale=False,
+        lr0 = 0.003,  
+        lrf = 0.05,      
+        weight_decay = 0.001, 
+        dropout = 0.0,
+        # warmup_epochs = 5.0,
+        # warmup_momentum = 0.85,
+        # warmup_bias_lr = 0.08,
+        patience=10000,
+        plots = True,
+        overlap_mask = False,
+    )

@@ -13,6 +13,7 @@ import numpy as np
 import pandas as pd
 from shapely.geometry import Polygon, Point
 import time
+import math
 
 start_time = time.time()
 
@@ -20,10 +21,29 @@ calculate_metrics = True
 MAP_MIN_SCORE = 0.001                   
 IOU_LIST_FOR_MAP = [0.5] + [round(0.5 + 0.05*i, 2) for i in range(1, 10)] 
 tile_sizes = [128, 416]
-overlaps = [20, 50]
-iou_threshold = 0.2 # Representation
-iou_thr = 0.2 # Metric
+overlaps = [50, 150]
+iou_threshold = 0.4 # Representation
+iou_thr = 0.5 # Metric
 models = [YOLO("best128.pt"), YOLO("best416.pt")]
+
+# ===== Evaluation / Fusion Controls =====
+# Single-scale controls
+SINGLE_MANUAL_THR = 0.5    # used only when SINGLE_USE_BEST=False
+
+# Two-scale controls (base + add-on)
+MS_BASE_SCALE = 128            # which scale is the base (e.g., 128 or 416)
+MS_BASE_MANUAL_THR = 0.5      # used only when MS_BASE_USE_BEST=False
+
+MS_ADD_SCALE = 416             # the second scale to add on top of base
+MS_ADD_MANUAL_THR = 0.5       # used only when MS_ADD_USE_BEST=False
+
+# --- Border suppression ---
+MARGIN_128 = 10  
+MARGIN_416 = 20  
+
+CONS_IOU_PARTNER = 0.40   # IoU threshold to consider two boxes (same class) as partners
+CONS_LOW  = 0.25          # lower bound for "usable" confidence in fusion stage
+CONS_HIGH = 0.70          # high-confidence threshold for solo-keep and high-vs-high
 
 # Define colors for different classes
 CLASS_COLORS = {
@@ -84,9 +104,44 @@ else:
     }
     
 # Classes to exclude completely (will not be shown on the image)
-EXCLUDED_CLASSES = {12, 13}
-
+EXCLUDED_CLASSES = {}
 all_dets_per_image = {}  
+
+def get_imgsz(model, default_size):
+    """
+    Get the effective input size (imgsz) for this YOLO model.
+    Falls back to the tile_size if unavailable.
+    """
+    try:
+        sz = model.model.args.get('imgsz', None)
+        if isinstance(sz, (list, tuple)):
+            sz = max(sz)
+        return int(sz) if sz else int(default_size)
+    except Exception:
+        return int(default_size)
+
+def margin_for(tile_size: int) -> int:
+    return MARGIN_128 if tile_size <= 128 else MARGIN_416
+
+def box_center_from_xyxyxyxy(points8):
+    """
+    points8: [x1,y1,x2,y2,x3,y3,x4,y4] in *global* coordinates.
+    Returns (cx, cy) as the average of the four vertices.
+    """
+    cx = (points8[0] + points8[2] + points8[4] + points8[6]) / 4.0
+    cy = (points8[1] + points8[3] + points8[5] + points8[7]) / 4.0
+    return cx, cy
+
+def center_inside_safe_region(points8, crop_x0, crop_y0, crop_w, crop_h, margin_px: int) -> bool:
+    """
+    Check if the box center is at least `margin_px` away from each crop border.
+    crop_* are in *global* coordinates except crop_w/h which are sizes.
+    """
+    cx, cy = box_center_from_xyxyxyxy(points8)
+    cx_rel = cx - crop_x0
+    cy_rel = cy - crop_y0
+    return (margin_px <= cx_rel <= (crop_w - margin_px)) and (margin_px <= cy_rel <= (crop_h - margin_px))
+
 
 def compute_angle_from_bbox(points):
     """
@@ -144,40 +199,72 @@ def _center_of_poly8(poly8):
     return (sum(xs) / 4.0, sum(ys) / 4.0)
 
 
-def detect_symbols(image, model, tile_size, overlap):
+def detect_symbols(image, model, tile_size: int, overlap: int):
     """
-    Detect objects in an image using a given model, tile size, and overlap.
+    Run tiled detection and return global OBB detections.
+    Assumes model(crop) returns objects with .obb where each item has:
+        - xyxyxyxy (tensor shape [1,8])
+        - conf (tensor shape [1])
+        - cls (tensor shape [1])
+    Adapt the accessors if API differs.
     """
-    h, w, _ = image.shape
-    step = tile_size - overlap
+    H, W = image.shape[:2]
+    step = max(1, tile_size - overlap)
     detections = []
-    for y in range(0, h, step):
-        for x in range(0, w, step):
-            crop_detections = []
-            crop = image[y:y + tile_size, x:x + tile_size]
+
+    margin_px = margin_for(tile_size)
+
+    for y in range(0, H, step):
+        for x in range(0, W, step):
+            y2 = min(y + tile_size, H)
+            x2 = min(x + tile_size, W)
+            crop = image[y:y2, x:x2]
             # if crop.shape[0] != tile_size or crop.shape[1] != tile_size:
             #     continue
-            # crop_gray = convert_bgr_to_rgb(crop)
+            crop_h, crop_w = crop.shape[:2]
+
+            if crop_h == 0 or crop_w == 0:
+                continue
+
             results = model(crop)
-            for box in results[0].obb:
-                points = [int(x) for x in box.xyxyxyxy[0].flatten().tolist()]
-                x1, y1, x2, y2, x3, y3, x4, y4 = points
-                cls = int(box.cls[0])
-                conf = float(box.conf[0])
-                if conf < CLASS_THRESHOLDS.get(cls, 0.05):
+
+            crop_dets = []
+            for det in results[0].obb:
+                points = [float(v) for v in det.xyxyxyxy[0].flatten().tolist()]
+                cls_id = int(det.cls[0])
+                conf = float(det.conf[0])
+
+                if conf < CLASS_THRESHOLDS.get(cls_id, 0.05):
                     continue
-                
-                if CLASS_NAMES.get(cls, f"Class{cls}") == "Strike": 
-                    angle = compute_angle_from_bbox(points)
+
+                gx = [points[0] + x, points[2] + x, points[4] + x, points[6] + x]
+                gy = [points[1] + y, points[3] + y, points[5] + y, points[7] + y]
+                global_points8 = [gx[0], gy[0], gx[1], gy[1], gx[2], gy[2], gx[3], gy[3]]
+
+                # border suppression (ignore centers near crop borders)
+                if margin_px > 0:
+                    if not center_inside_safe_region(
+                        global_points8, crop_x0=x, crop_y0=y, crop_w=crop_w, crop_h=crop_h, margin_px=margin_px
+                    ):
+                        continue
+
+                if CLASS_NAMES.get(cls_id, f"Class{cls_id}") == "Strike":
+                    angle = compute_angle_from_bbox(points)  
                 else:
-                    angle = 0
-                crop_detections.append((x1 + x, y1 + y, x2 + x, y2 + y, x3 + x, y3 + y,\
-                                        x4 + x, y4 + y, cls, conf, angle))
-            detections.extend(merge_detections(crop_detections, iou_threshold))
-                    
+                    angle = 0.0
+
+                crop_dets.append((
+                    global_points8[0], global_points8[1], global_points8[2], global_points8[3],
+                    global_points8[4], global_points8[5], global_points8[6], global_points8[7],
+                    cls_id, conf, angle
+                ))
+
+            detections.extend(merge_detections(crop_dets, iou_threshold))
+
     return detections
 
-def merge_detections(detections, iou_threshold=0.5, excluse_check=True):
+
+def merge_detections(detections, iou_threshold=0.5, exclude_check=True):
     """
     Merge overlapping detections while considering confidence and class types.
     
@@ -204,7 +291,7 @@ def merge_detections(detections, iou_threshold=0.5, excluse_check=True):
         # poly1 = Polygon([(box1[i], box1[i+1]) for i in range(0, 8, 2)])
         keep = True
 
-        if excluse_check:
+        if exclude_check:
             for det_excl in excluded_boxes:
                excl_box, excl_cls, excl_conf = det_excl[:8], det_excl[8], det_excl[9]
                # poly_excl = Polygon([(excl_box[i], excl_box[i+1]) for i in range(0, 8, 2)])
@@ -230,39 +317,198 @@ def merge_detections(detections, iou_threshold=0.5, excluse_check=True):
     
     return merged
 
+def int_point(x, y, width, height):
+    """Clamp and cast (x, y) to a valid integer tuple inside the image."""
+    xi = int(round(x))
+    yi = int(round(y))
+    xi = max(0, min(width - 1, xi))
+    yi = max(0, min(height - 1, yi))
+    return (xi, yi)
+    
+def _best_partner(det, pool, iou_thr):
+    """Return the best same-class partner of `det` in `pool` based on IoU."""
+    box1, cls1 = det[:8], int(det[8])
+    best = None
+    best_iou = 0.0
+    for d in pool:
+        if int(d[8]) != cls1:
+            continue
+        iou = compute_polygon_iou(box1, d[:8])
+        if iou >= iou_thr and iou > best_iou:
+            best = d
+            best_iou = iou
+    return best, best_iou
+
+def cross_scale_consensus_filter(dets_by_scale):
+    """
+    Input: dict {scale -> [detections]}, detection = (x1..y4, cls, score, angle)
+    Rules:
+      - SOLO: if no partner -> keep only if conf >= CONS_HIGH (else drop)
+      - BOTH in [CONS_LOW, CONS_HIGH): keep the higher, drop the other
+      - BOTH >= CONS_HIGH: keep the higher, drop the other
+      - MIXED: one >= CONS_HIGH and other in [CONS_LOW, CONS_HIGH) -> keep the higher (the high one)
+      - A partner with conf < CONS_LOW is ignored (treated as no partner)
+    Output: list of detections after applying the above consensus (no WBF).
+    """
+    scales = sorted(dets_by_scale.keys())
+    if len(scales) == 1:
+        return list(dets_by_scale[scales[0]])
+
+    kept = []
+    visited = {s: [False]*len(dets_by_scale[s]) for s in scales}
+
+    # flatten for single pass
+    flat = []
+    for s in scales:
+        for idx, d in enumerate(dets_by_scale[s]):
+            flat.append((s, idx, d))
+
+    # map other scales for each scale
+    others = {sc: [t for t in scales if t != sc] for sc in scales}
+
+    for s, i, d in flat:
+        if visited[s][i]:
+            continue
+
+        cls_d = int(d[8])
+        conf_d = float(d[9])
+
+        # find best partner across other scales (same class, IoU >= CONS_IOU_PARTNER)
+        best_partner = None
+        best_partner_tuple = None
+        best_partner_conf = -1.0
+        best_partner_iou = 0.0
+
+        for t in others[s]:
+            pool = dets_by_scale[t]
+            for j, p in enumerate(pool):
+                if visited[t][j]:
+                    continue
+                if int(p[8]) != cls_d:
+                    continue
+                iou = compute_polygon_iou(d[:8], p[:8])
+                if iou >= CONS_IOU_PARTNER:
+                    conf_p = float(p[9])
+                    # choose partner primarily by higher confidence (tie-breaker: higher IoU)
+                    if (conf_p > best_partner_conf) or (conf_p == best_partner_conf and iou > best_partner_iou):
+                        best_partner = p
+                        best_partner_tuple = (t, j, p)
+                        best_partner_conf = conf_p
+                        best_partner_iou = iou
+
+        if best_partner is None or best_partner_conf < CONS_LOW:
+            # SOLO case (no usable partner)
+            if conf_d >= CONS_HIGH:
+                kept.append(d)  # keep strong solo
+            # else drop
+            visited[s][i] = True
+            continue
+
+        # we have a usable partner (best_partner_conf >= CONS_LOW)
+        conf_p = best_partner_conf
+
+        # define buckets for clarity
+        d_low   = (CONS_LOW <= conf_d  < CONS_HIGH)
+        d_high  = (conf_d >= CONS_HIGH)
+        p_low   = (CONS_LOW <= conf_p  < CONS_HIGH)
+        p_high  = (conf_p  >= CONS_HIGH)
+
+        # CASES:
+        # 1) both in low-range -> keep higher
+        if d_low and p_low:
+            if conf_d >= conf_p:
+                kept.append(d)
+            else:
+                kept.append(best_partner)
+            visited[s][i] = True
+            t, j, _ = best_partner_tuple
+            visited[t][j] = True
+            continue
+
+        # 2) both high -> keep higher
+        if d_high and p_high:
+            if conf_d >= conf_p:
+                kept.append(d)
+            else:
+                kept.append(best_partner)
+            visited[s][i] = True
+            t, j, _ = best_partner_tuple
+            visited[t][j] = True
+            continue
+
+        # 3) mixed: one high, one low -> keep the higher (the high one)
+        if d_high and p_low:
+            kept.append(d)
+        elif d_low and p_high:
+            kept.append(best_partner)
+        else:
+            # fallback: if any weird edge, keep the higher
+            if conf_d >= conf_p:
+                kept.append(d)
+            else:
+                kept.append(best_partner)
+
+        visited[s][i] = True
+        t, j, _ = best_partner_tuple
+        visited[t][j] = True
+
+    return kept
+
 
 def process_image(image_path, output_dir):
     """
-    Process an image by applying object detection at multiple tile sizes and merging the results.
+    Process one image:
+      - Run tiled detection for each (tile_size, overlap, model).
+      - If multi-scale and SIZE_ROUTING_ENABLED: do size-based routing
+        (small boxes from the smaller scale, base scale handles the rest).
+      - Else (single-scale): keep the original merging behavior.
+      - Draw, save image and Excel as before.
     """
+    t0 = time.time()
     image = cv2.imread(image_path)
-    all_detections = []
+    if image is None:
+        print(f"[Warn] Could not read image: {image_path}")
+        return
+
+    dets_by_scale = {}
     for tile_size, overlap, model in zip(tile_sizes, overlaps, models):
-        all_detections.extend(detect_symbols(image, model, tile_size, overlap))
-    
-    print("--- %s seconds ---" % (time.time() - start_time))
-    
-    merged_detections = merge_detections(all_detections, iou_threshold, False)
+        dets = detect_symbols(image, model, tile_size, overlap)  
+        dets_by_scale[tile_size] = dets
+
+    consensus_dets = cross_scale_consensus_filter(dets_by_scale)
+    merged_detections = merge_detections(consensus_dets, iou_threshold, False)
+
+    print(f"--- {time.time() - t0:.3f} seconds ---")
+
+    # 3) Drawing and export
     result_image = image.copy()
     image_name = os.path.basename(image_path)
-    excel_path = os.path.join(output_dir, image_name.replace(".jpg", ".xlsx").replace(".png", ".xlsx"))
-    
-    data = []
-    for x1, y1, x2, y2, x3, y3, x4, y4, cls, conf, angle in merged_detections:
-        if cls in EXCLUDED_CLASSES:
-            continue  
+    excel_path = os.path.join(
+        output_dir,
+        image_name.replace(".jpg", ".xlsx").replace(".png", ".xlsx")
+    )
+
+    rows = []
+    H, W = result_image.shape[:2]
+    for (x1, y1, x2, y2, x3, y3, x4, y4, cls_id, conf, angle) in merged_detections:
+        if cls_id in EXCLUDED_CLASSES:
+            continue
+
+        color = CLASS_COLORS.get(cls_id, (0, 255, 255))
+        color = tuple(int(c) for c in color)  
+        label = CLASS_NAMES.get(cls_id, f"Class{cls_id}")
+
+        pts = np.array([[x1, y1], [x2, y2], [x3, y3], [x4, y4]], dtype=np.int32)
+        cv2.polylines(result_image, [pts], isClosed=True, color=color, thickness=2)
+
+        tx = int(max(0, min(W - 1, round(min(x1, x2, x3, x4)))))
+        ty = int(max(0, min(H - 1, round(min(y1, y2, y3, y4) - 10))))
+        cv2.putText(result_image, f"{label} {conf:.2f}", (tx, ty),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2, lineType=cv2.LINE_AA)
         
-        color = CLASS_COLORS.get(cls, (0, 255, 255))
-        label = CLASS_NAMES.get(cls, f"Class{cls}")
-        
-        # Draw polygon
-        points = np.array([[x1, y1], [x2, y2], [x3, y3], [x4, y4]], np.int32)
-        cv2.polylines(result_image, [points], isClosed=True, color=color, thickness=2)
-        
-        # Place label text above the box
-        text_x = min(x1, x2, x3, x4)
-        text_y = min(y1, y2, y3, y4) - 10  # Shift text above the box
-        cv2.putText(result_image, f"{label} {conf:.2f}", (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+        # text_x = min(x1, x2, x3, x4)
+        # text_y = min(y1, y2, y3, y4) - 10  # Shift text above the box
+        # cv2.putText(result_image, f"{label} {conf:.2f}", (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
         
         # Draw polygon
         # points = np.array([[x1, y1], [x2, y2], [x3, y3], [x4, y4]], np.int32)
@@ -279,16 +525,21 @@ def process_image(image_path, output_dir):
         # text_y = min(y1, y2, y3, y4) - 15  # Shift text above the corner numbers
         # cv2.putText(result_image, f"{label} {conf:.2f}", (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
+        rows.append([label, x1, y1, x2, y2, x3, y3, x4, y4, conf, angle])
 
-        data.append([label, x1, y1, x2, y2, x3, y3, x4, y4, conf, angle])
-    
-    output_path = os.path.join(output_dir, os.path.basename(image_path).replace(".jpg", "_detected.jpg").replace(".png", "_detected.jpg"))
-    cv2.imwrite(output_path, result_image)
-    
-    df = pd.DataFrame(data, columns=["Class", "X1", "Y1", "X2", "Y2", "X3", "Y3", "X4", "Y4", "Confidence", "Angle"])
+    # save visual
+    out_jpg = os.path.join(
+        output_dir,
+        image_name.replace(".jpg", "_detected.jpg").replace(".png", "_detected.jpg")
+    )
+    cv2.imwrite(out_jpg, result_image)
+
+    # save excel
+    df = pd.DataFrame(rows, columns=["Class", "X1", "Y1", "X2", "Y2", "X3", "Y3", "X4", "Y4", "Confidence", "Angle"])
     df.to_excel(excel_path, index=False)
-    
+
     all_dets_per_image[image_path] = merged_detections
+
 
 def _label_path_for_image(image_path):
     base = os.path.splitext(os.path.basename(image_path))[0] + ".txt"
@@ -370,18 +621,11 @@ def _evaluate_dataset(all_images, conf_thr, iou_thr):
         tot_tp += tp; tot_fp += fp; tot_fn += fn
     return _prec_rec_f1(tot_tp, tot_fp, tot_fn)
 
-def _find_best_conf_threshold(all_images, iou_thr=0.5):
-    best = {"thr": 0.25, "P": 0.0, "R": 0.0, "F1": -1.0}
-    for thr in np.linspace(0.05, 0.95, 19):
-        P, R, F1 = _evaluate_dataset(all_images, conf_thr=float(thr), iou_thr=iou_thr)
-        if F1 > best["F1"]:
-            best = {"thr": float(thr), "P": float(P), "R": float(R), "F1": float(F1)}
-    return best
-
-def _classwise_report(all_images, conf_thr, iou_thr):
+def _classwise_report(dets_source, all_images, conf_thr, iou_thr):
     rows = []
+    # collect class ids from source
     all_cids = set()
-    for dets in all_dets_per_image.values():
+    for dets in dets_source.values():
         for d in dets:
             all_cids.add(int(d[8]))
     try:
@@ -392,36 +636,23 @@ def _classwise_report(all_images, conf_thr, iou_thr):
     for cid in all_cids:
         tp=fp=fn=0
         for img_path in all_images:
-            dets_all = all_dets_per_image.get(img_path, [])
+            dets_all = dets_source.get(img_path, [])
             dets_c = [d for d in dets_all if (int(d[8])==cid and d[9]>=conf_thr)]
             gts = _load_gt_as_pixels(img_path)
             gts_c = [g for g in gts if g["cls"]==cid]
             tpp,fpp,fnn = _match_dets_to_gts_pixel(dets_c, gts_c, iou_thr=iou_thr)
             tp += tpp; fp += fpp; fn += fnn
         P,R,F1 = _prec_rec_f1(tp,fp,fn)
-        try:
-            cname = CLASS_NAMES.get(cid, str(cid))
-        except NameError:
-            cname = str(cid)
+        cname = CLASS_NAMES.get(cid, str(cid)) if 'CLASS_NAMES' in globals() else str(cid)
         rows.append([cid, cname, tp, fp, fn, P, R, F1])
 
-    if pd is None:
-        print("\n[Classwise metrics]")
-        for r in rows:
-            print(f"cls={r[0]:>2} {r[1]:<20} TP={r[2]:<5} FP={r[3]:<5} FN={r[4]:<5} P={r[5]:.3f} R={r[6]:.3f} F1={r[7]:.3f}")
-        return None
-    else:
-        df = pd.DataFrame(rows, columns=["cls_id","class","TP","FP","FN","Precision","Recall","F1"])
-        try:
-            save_dir = output_dir
-        except NameError:
-            save_dir = "."
-        out_path = os.path.join(save_dir, "fusion_classwise_metrics.xlsx")
-        df.to_excel(out_path, index=False)
-        print(f"[Saved] {out_path}")
-        return df
+    df = pd.DataFrame(rows, columns=["cls_id","class","TP","FP","FN","Precision","Recall","F1"])
+    out_path = os.path.join(output_dir, "fusion_classwise_metrics.xlsx")
+    df.to_excel(out_path, index=False)
+    print(f"[Saved] {out_path}")
+    return df
 
-# ---- New: functions to compute AP / mAP across IoU thresholds ----
+# ---- functions to compute AP / mAP across IoU thresholds ----
 def compute_ap_from_pr(recall, precision):
     """
     Compute AP as area under precision-recall curve using trapezoidal rule.
@@ -439,29 +670,21 @@ def compute_ap_from_pr(recall, precision):
     ap = np.sum((mrec[idx+1] - mrec[idx]) * mpre[idx+1])
     return ap
 
-def gather_detections_and_gts(all_images, cls_id):
+def gather_detections_and_gts(dets_source, all_images, cls_id):
     try:
         if cls_id in EXCLUDED_CLASSES:
             return [], {}
     except NameError:
         pass
-
     dets, gts = [], {}
     for img_path in all_images:
-        img_dets_all = all_dets_per_image.get(img_path, [])
-
-        img_dets_cls = [d for d in img_dets_all if int(d[8]) == cls_id]
-
-        for d in img_dets_cls:
+        img_dets = [d for d in dets_source.get(img_path, []) if int(d[8]) == cls_id]
+        for d in img_dets:
             if d[9] >= MAP_MIN_SCORE:
                 dets.append({"image_id": img_path, "score": float(d[9]), "bbox": d[:8]})
-
         gt_boxes = _load_gt_as_pixels(img_path)
         gts[img_path] = [[c for pt in g["pts"] for c in pt] for g in gt_boxes if g["cls"] == cls_id]
-
     return dets, gts
-
-
 
 def compute_pr_for_class(dets, gts, iou_thr=0.5):
     """
@@ -516,23 +739,21 @@ def _gt_class_ids(all_images):
         pass
     return sorted(s)
 
-def evaluate_map(all_images, iou_list=None):
+def evaluate_map(dets_source, all_images, iou_list=None):
     """
     Compute mAP for all classes across IoU thresholds in iou_list.
     By default calculates mAP@0.5 and mAP@[0.5:0.95]
     """
     if iou_list is None:
         iou_list = IOU_LIST_FOR_MAP
-    # class_ids = sorted({int(d[8]) for dets in all_dets_per_image.values() for d in dets if int(d[8]) not in EXCLUDED_CLASSES})
     class_ids = _gt_class_ids(all_images)
     per_iou_map = {}
-    # for each IoU threshold compute AP per class
     for iou in iou_list:
         ap_list = []
         for cid in class_ids:
-            dets, gts = gather_detections_and_gts(all_images, cid)
+            dets, gts = gather_detections_and_gts(dets_source, all_images, cid)
             precision, recall, ap = compute_pr_for_class(dets, gts, iou_thr=iou)
-            if ap is not None:              
+            if ap is not None:
                 ap_list.append(ap)
         per_iou_map[iou] = float(np.mean(ap_list)) if ap_list else 0.0
     map50 = per_iou_map.get(0.5, 0.0)
@@ -587,44 +808,59 @@ def evaluate_center_hit(all_images, conf_thr=0.5):
 
 
 def run_fusion_eval(input_dir, iou_thr):
+    global all_dets_per_image
     all_images = [os.path.join(input_dir, f) for f in os.listdir(input_dir)
                   if f.lower().endswith(('.png','.jpg','.jpeg','.tif','.tiff'))]
     if not all_images:
         print("[Eval] No images found for evaluation.")
         return
 
-    print(f"Tile size: {tile_sizes}, Overlap: {overlaps}")    
-    best = _find_best_conf_threshold(all_images, iou_thr=iou_thr)
-    print(f"[Fusion] Best confidence threshold (by F1): {best['thr']:.2f} | P={best['P']:.3f} R={best['R']:.3f} F1={best['F1']:.3f}")
-    P, R, F1 = _evaluate_dataset(all_images, conf_thr=best['thr'], iou_thr=iou_thr)
-    print(f"[Fusion @ {best['thr']:.2f}] Precision={P:.3f} | Recall={R:.3f} | F1={F1:.3f}")
-    _classwise_report(all_images, conf_thr=best['thr'], iou_thr=iou_thr)
-    evaluate_center_hit(all_images, conf_thr=best['thr'])
-    # compute mAPs
-    maps = evaluate_map(all_images, iou_list=list(np.arange(0.5, 0.96, 0.05)))
+    print(f"Tile size: {tile_sizes}, Overlap: {overlaps}")
+
+    # ===== SINGLE-SCALE =====
+    if len(models) == 1 or len(tile_sizes) == 1:
+        thr = float(SINGLE_MANUAL_THR)
+        print(f"[Single-scale] Using manual threshold: {thr:.2f}")
+        P, R, F1 = _evaluate_dataset(all_images, conf_thr=thr, iou_thr=iou_thr)
+        print(f"[Report @ {thr:.2f}] Precision={P:.3f} | Recall={R:.3f} | F1={F1:.3f}")
+
+        _classwise_report(all_dets_per_image, all_images, conf_thr=thr, iou_thr=iou_thr)
+        evaluate_center_hit(all_images, conf_thr=thr)
+
+        maps = evaluate_map(all_dets_per_image, all_images, iou_list=list(np.arange(0.5, 0.96, 0.05)))
+        print("[mAP Results]")
+        print(f"mAP@0.5 = {maps['mAP@0.5']:.4f}")
+        print(f"mAP@[0.5:0.95] = {maps['mAP@[0.5:0.95]']:.4f}")
+
+        maps_soft = evaluate_map(all_dets_per_image, all_images, iou_list=[0.30,0.40,0.50,0.60,0.70])
+        print("[mAP (soft) Results]")
+        print(f"mAP@0.3 = {maps_soft['per_iou'][0.30]:.4f}")
+        soft_avg = float(np.mean([maps_soft['per_iou'][i] for i in [0.30,0.40,0.50,0.60,0.70]]))
+        print(f"mAP@[0.3:0.7] = {soft_avg:.4f}")
+        return
+
+    # ===== MULTI-SCALE =====
+    print("[Fusion] scale-agnostic merge (late fusion).")
+    thr = float(MS_BASE_MANUAL_THR)  
+    print(f"[Fusion] Using manual threshold: {thr:.2f}")
+
+    P, R, F1 = _evaluate_dataset(all_images, conf_thr=thr, iou_thr=iou_thr)
+    print(f"[Fusion @ {thr:.2f}] Precision={P:.3f} | Recall={R:.3f} | F1={F1:.3f}")
+
+    _classwise_report(all_dets_per_image, all_images, conf_thr=thr, iou_thr=iou_thr)
+    evaluate_center_hit(all_images, conf_thr=thr)
+
+    maps = evaluate_map(all_dets_per_image, all_images, iou_list=list(np.arange(0.5, 0.96, 0.05)))
     print("[mAP Results]")
     print(f"mAP@0.5 = {maps['mAP@0.5']:.4f}")
     print(f"mAP@[0.5:0.95] = {maps['mAP@[0.5:0.95]']:.4f}")
-    
-    maps_soft = evaluate_map(all_images, iou_list=[0.30, 0.40, 0.50, 0.60, 0.70])
+
+    maps_soft = evaluate_map(all_dets_per_image, all_images, iou_list=[0.30,0.40,0.50,0.60,0.70])
     print("[mAP (soft) Results]")
     print(f"mAP@0.3 = {maps_soft['per_iou'][0.30]:.4f}")
     soft_avg = float(np.mean([maps_soft['per_iou'][i] for i in [0.30,0.40,0.50,0.60,0.70]]))
     print(f"mAP@[0.3:0.7] = {soft_avg:.4f}")
-    
-    # save per-IoU mAP
-    try:
-        save_dir = output_dir
-    except NameError:
-        save_dir = "."
-    per_iou_rows = [{"iou": k, "mAP": v} for k, v in maps["per_iou"].items()]
-    pd.DataFrame(per_iou_rows).to_excel(os.path.join(save_dir, "fusion_map_per_iou.xlsx"), index=False)
-    print(f"[Saved] mAP per IoU table to {os.path.join(save_dir, 'fusion_map_per_iou.xlsx')}")
-    
-    soft_rows = [{"iou": k, "mAP": v} for k, v in maps_soft["per_iou"].items()]
-    pd.DataFrame(soft_rows).to_excel(os.path.join(save_dir, "fusion_map_per_iou_soft.xlsx"), index=False)
-    print(f"[Saved] soft mAP per IoU table to {os.path.join(save_dir, 'fusion_map_per_iou_soft.xlsx')}")
-    
+
 
 input_dir = "Input"
 output_dir = "Output"
