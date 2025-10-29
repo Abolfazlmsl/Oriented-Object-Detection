@@ -11,12 +11,10 @@ names:
   9: Spring T2
   10: Spring T3
   11: Mine_Pit T2
-  12: Spring 2 back
-  13: Hill back 1
 
 path: ../datasets/GeoMap # dataset root dir
-train: train_cropped_filt.txt
-val: val_cropped_filt.txt
+train: train_cropped128.txt
+val: val_cropped128.txt
 #test: test.txt
 
 #augmentation:
