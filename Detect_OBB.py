@@ -21,23 +21,24 @@ calculate_metrics = True
 MAP_MIN_SCORE = 0.001                   
 IOU_LIST_FOR_MAP = [0.5] + [round(0.5 + 0.05*i, 2) for i in range(1, 10)] 
 tile_sizes = [128, 416]
-overlaps = [50, 150]
+overlaps = [30, 100]
 iou_threshold = 0.4 # Representation
-iou_thr = 0.5 # Metric
+iou_thr = 0.25 # Metric
 models = [YOLO("best128.pt"), YOLO("best416.pt")]
 
 # ===== Evaluation / Fusion Controls =====
 # Single-scale controls
-SINGLE_MANUAL_THR = 0.5    # used only when SINGLE_USE_BEST=False
+SINGLE_MANUAL_THR = 0.25    # used only when SINGLE_USE_BEST=False
 
 # Two-scale controls (base + add-on)
 MS_BASE_SCALE = 128            # which scale is the base (e.g., 128 or 416)
-MS_BASE_MANUAL_THR = 0.5      # used only when MS_BASE_USE_BEST=False
+MS_BASE_MANUAL_THR = 0.25      # used only when MS_BASE_USE_BEST=False
 
 MS_ADD_SCALE = 416             # the second scale to add on top of base
-MS_ADD_MANUAL_THR = 0.5       # used only when MS_ADD_USE_BEST=False
+MS_ADD_MANUAL_THR = 0.25       # used only when MS_ADD_USE_BEST=False
 
 # --- Border suppression ---
+APPLY_BORDER_FILTER = True
 MARGIN_128 = 10  
 MARGIN_416 = 20  
 
@@ -59,8 +60,6 @@ CLASS_COLORS = {
     9: (60, 50, 20), # Spring 2  
     10: (200, 150, 80), # Spring 3  
     11: (100, 200, 150), # Minepit 2 
-    12: (12, 52, 83), # Spring B2
-    13: (123, 232, 23), # Spring B2 
 }
 
 # Define class names
@@ -77,8 +76,6 @@ CLASS_NAMES = {
     9: "Spring 2",
     10: "Spring 3",
     11: "Minepit 2",
-    12: "Spring B2",
-    13: "Hillside B2",
 }
 
 
@@ -99,8 +96,6 @@ else:
         9: 0.7,  # Spring 2
         10: 0.7,  # Spring 3
         11: 0.6,  # Minepit 2
-        12: 0.05,  # Spring B2
-        13: 0.05,  # Hillside B2
     }
     
 # Classes to exclude completely (will not be shown on the image)
@@ -206,7 +201,6 @@ def detect_symbols(image, model, tile_size: int, overlap: int):
         - xyxyxyxy (tensor shape [1,8])
         - conf (tensor shape [1])
         - cls (tensor shape [1])
-    Adapt the accessors if API differs.
     """
     H, W = image.shape[:2]
     step = max(1, tile_size - overlap)
@@ -219,50 +213,59 @@ def detect_symbols(image, model, tile_size: int, overlap: int):
             y2 = min(y + tile_size, H)
             x2 = min(x + tile_size, W)
             crop = image[y:y2, x:x2]
-            # if crop.shape[0] != tile_size or crop.shape[1] != tile_size:
-            #     continue
             crop_h, crop_w = crop.shape[:2]
 
             if crop_h == 0 or crop_w == 0:
                 continue
 
             results = model(crop)
-
             crop_dets = []
+
             for det in results[0].obb:
                 points = [float(v) for v in det.xyxyxyxy[0].flatten().tolist()]
                 cls_id = int(det.cls[0])
                 conf = float(det.conf[0])
 
+                # per-class conf threshold
                 if conf < CLASS_THRESHOLDS.get(cls_id, 0.05):
                     continue
 
+                # convert local tile coords -> global image coords
                 gx = [points[0] + x, points[2] + x, points[4] + x, points[6] + x]
                 gy = [points[1] + y, points[3] + y, points[5] + y, points[7] + y]
-                global_points8 = [gx[0], gy[0], gx[1], gy[1], gx[2], gy[2], gx[3], gy[3]]
+                global_points8 = [
+                    gx[0], gy[0], gx[1], gy[1],
+                    gx[2], gy[2], gx[3], gy[3]
+                ]
 
-                # border suppression (ignore centers near crop borders)
-                if margin_px > 0:
+                # OPTIONAL border suppression (disabled for fair eval)
+                if APPLY_BORDER_FILTER and margin_px > 0:
                     if not center_inside_safe_region(
-                        global_points8, crop_x0=x, crop_y0=y, crop_w=crop_w, crop_h=crop_h, margin_px=margin_px
+                        global_points8,
+                        crop_x0=x, crop_y0=y,
+                        crop_w=crop_w, crop_h=crop_h,
+                        margin_px=margin_px
                     ):
                         continue
 
+                # angle only for Strike
                 if CLASS_NAMES.get(cls_id, f"Class{cls_id}") == "Strike":
-                    angle = compute_angle_from_bbox(points)  
+                    angle = compute_angle_from_bbox(points)
                 else:
                     angle = 0.0
 
                 crop_dets.append((
-                    global_points8[0], global_points8[1], global_points8[2], global_points8[3],
-                    global_points8[4], global_points8[5], global_points8[6], global_points8[7],
+                    global_points8[0], global_points8[1],
+                    global_points8[2], global_points8[3],
+                    global_points8[4], global_points8[5],
+                    global_points8[6], global_points8[7],
                     cls_id, conf, angle
                 ))
 
+            # local NMS merge for this crop
             detections.extend(merge_detections(crop_dets, iou_threshold))
 
     return detections
-
 
 def merge_detections(detections, iou_threshold=0.5, exclude_check=True):
     """
@@ -689,44 +692,59 @@ def gather_detections_and_gts(dets_source, all_images, cls_id):
 def compute_pr_for_class(dets, gts, iou_thr=0.5):
     """
     dets: list of {'image_id','score','bbox'}
-    gts: dict image_id -> list of gt bboxes (list of 8 coords)
-    returns: precision array, recall array, ap
+    gts:  dict image_id -> list of gt bboxes (list of 8 coords)
+    returns:
+      precision array,
+      recall array,
+      ap (area under PR),
+      mean_precision (avg precision over curve),
+      mean_recall (avg recall over curve),
+      total_TP, total_FP, total_FN
     """
-    # count total positives
-    npos = sum(len(v) for v in gts.values())
+    npos = sum(len(v) for v in gts.values())  # total GT count
     if npos == 0:
-        return np.array([0.0]), np.array([0.0]), None
-    # sort detections by score desc
+        return np.array([0.0]), np.array([0.0]), None, 0.0, 0.0, 0, 0, 0
+
     dets_sorted = sorted(dets, key=lambda x: x["score"], reverse=True)
     tp = np.zeros(len(dets_sorted))
     fp = np.zeros(len(dets_sorted))
-    # keep track of matched GTs per image
-    matched = {img: np.zeros(len(gts.get(img,[])), dtype=bool) for img in gts.keys()}
+    matched = {img: np.zeros(len(gts.get(img, [])), dtype=bool) for img in gts.keys()}
+
     for i, det in enumerate(dets_sorted):
         img = det["image_id"]
         box_det = det["bbox"]
-        best_iou = 0.0
-        best_j = -1
+        best_iou, best_j = 0.0, -1
         gt_list = gts.get(img, [])
+
         for j, gt_box in enumerate(gt_list):
             if matched[img][j]:
                 continue
             iou = compute_polygon_iou(box_det, gt_box)
             if iou > best_iou:
-                best_iou = iou
-                best_j = j
-        if best_iou >= iou_thr:
+                best_iou, best_j = iou, j
+
+        if best_iou >= iou_thr and best_j >= 0:
             tp[i] = 1
             matched[img][best_j] = True
         else:
             fp[i] = 1
-    # cumulative
+
     tp_cum = np.cumsum(tp)
     fp_cum = np.cumsum(fp)
     recall = tp_cum / (npos + 1e-9)
     precision = tp_cum / (tp_cum + fp_cum + 1e-9)
     ap = compute_ap_from_pr(recall, precision)
-    return precision, recall, ap
+
+    # mean precision / recall across curve
+    mean_precision = float(np.mean(precision)) if len(precision) else 0.0
+    mean_recall    = float(np.mean(recall))    if len(recall)    else 0.0
+
+    # total TP, FP, FN for this class at the end of sweep
+    total_TP = int(tp_cum[-1])
+    total_FP = int(fp_cum[-1])
+    total_FN = int(npos - total_TP)
+
+    return precision, recall, ap, mean_precision, mean_recall, total_TP, total_FP, total_FN
 
 def _gt_class_ids(all_images):
     s = set()
@@ -740,25 +758,66 @@ def _gt_class_ids(all_images):
     return sorted(s)
 
 def evaluate_map(dets_source, all_images, iou_list=None):
-    """
-    Compute mAP for all classes across IoU thresholds in iou_list.
-    By default calculates mAP@0.5 and mAP@[0.5:0.95]
-    """
     if iou_list is None:
         iou_list = IOU_LIST_FOR_MAP
+
     class_ids = _gt_class_ids(all_images)
+
     per_iou_map = {}
+    P_lists = {}
+    R_lists = {}
+
+    total_TP_sum = 0
+    total_FP_sum = 0
+    total_FN_sum = 0
+
     for iou in iou_list:
         ap_list = []
+        P_lists[iou] = []
+        R_lists[iou] = []
+
         for cid in class_ids:
             dets, gts = gather_detections_and_gts(dets_source, all_images, cid)
-            precision, recall, ap = compute_pr_for_class(dets, gts, iou_thr=iou)
+
+            precision, recall, ap, mean_P, mean_R, TP, FP, FN = compute_pr_for_class(
+                dets, gts, iou_thr=iou
+            )
+
             if ap is not None:
                 ap_list.append(ap)
+
+            P_lists[iou].append(mean_P)
+            R_lists[iou].append(mean_R)
+
+            # only accumulate totals for IoU = 0.5 (standard report)
+            if abs(iou - 0.5) < 1e-6:
+                total_TP_sum += TP
+                total_FP_sum += FP
+                total_FN_sum += FN
+
         per_iou_map[iou] = float(np.mean(ap_list)) if ap_list else 0.0
+
     map50 = per_iou_map.get(0.5, 0.0)
     map5095 = float(np.mean([per_iou_map[i] for i in iou_list])) if iou_list else 0.0
-    return {"mAP@0.5": map50, "mAP@[0.5:0.95]": map5095, "per_iou": per_iou_map}
+
+    if 0.5 in P_lists and len(P_lists[0.5]) > 0:
+        mean_precision_global = float(np.mean(P_lists[0.5]))
+        mean_recall_global    = float(np.mean(R_lists[0.5]))
+    else:
+        first_iou = iou_list[0]
+        mean_precision_global = float(np.mean(P_lists[first_iou])) if P_lists[first_iou] else 0.0
+        mean_recall_global    = float(np.mean(R_lists[first_iou])) if R_lists[first_iou] else 0.0
+
+    return {
+        "mAP@0.5": map50,
+        "mAP@[0.5:0.95]": map5095,
+        "per_iou": per_iou_map,
+        "mean_precision": mean_precision_global,
+        "mean_recall": mean_recall_global,
+        "TP": int(total_TP_sum),
+        "FP": int(total_FP_sum),
+        "FN": int(total_FN_sum),
+    }
 
 def evaluate_center_hit(all_images, conf_thr=0.5):
     """
@@ -831,6 +890,9 @@ def run_fusion_eval(input_dir, iou_thr):
         print("[mAP Results]")
         print(f"mAP@0.5 = {maps['mAP@0.5']:.4f}")
         print(f"mAP@[0.5:0.95] = {maps['mAP@[0.5:0.95]']:.4f}")
+        print(f"Mean Precision (PR-sweep, IoU=0.5) = {maps['mean_precision']:.4f}")
+        print(f"Mean Recall    (PR-sweep, IoU=0.5) = {maps['mean_recall']:.4f}")
+        print(f"TP={maps['TP']}, FP={maps['FP']}, FN={maps['FN']}")
 
         maps_soft = evaluate_map(all_dets_per_image, all_images, iou_list=[0.30,0.40,0.50,0.60,0.70])
         print("[mAP (soft) Results]")
@@ -854,6 +916,9 @@ def run_fusion_eval(input_dir, iou_thr):
     print("[mAP Results]")
     print(f"mAP@0.5 = {maps['mAP@0.5']:.4f}")
     print(f"mAP@[0.5:0.95] = {maps['mAP@[0.5:0.95]']:.4f}")
+    print(f"Mean Precision (PR-sweep, IoU=0.5) = {maps['mean_precision']:.4f}")
+    print(f"Mean Recall    (PR-sweep, IoU=0.5) = {maps['mean_recall']:.4f}")
+    print(f"TP={maps['TP']}, FP={maps['FP']}, FN={maps['FN']}")
 
     maps_soft = evaluate_map(all_dets_per_image, all_images, iou_list=[0.30,0.40,0.50,0.60,0.70])
     print("[mAP (soft) Results]")

@@ -15,24 +15,27 @@ from ultralytics import YOLO
 import numpy as np
 from scipy.ndimage import gaussian_filter
 from sklearn.cluster import KMeans
+import json
 
-CHANNELS = 3               # set to 3, 4, or 6
-APPLY_FILTERED_RGB = False
+CHANNELS = 4               # set to 3, 4, or 6
+APPLY_FILTERED_RGB = True
 
 # Configuration
 need_cropping = False 
 need_augmentation = False
 Dual_GPU = True
 TILE_SIZE = 416
-overlap = 150
+overlap = 100
 EPOCHS = 150
 BATCH_SIZE = 16
 WORKERS = 2
 CACHE = False       
 RECT = False  
 object_boundary_threshold = 0.1  # Minimum fraction of the bounding box that must remain in the crop
-class_balance_threshold = 400  # Minimum number of samples per class for balance
+class_balance_threshold = 800  # Minimum number of samples per class for balance
 augmentation_repeats = 2  # Number of times to augment underrepresented classes
+
+R_TARGET = 4 
 
 # === Filtering ===
 USM_RADIUS = 7.0           
@@ -45,6 +48,232 @@ if Dual_GPU:
     DEVICE = "0,1" if torch.cuda.is_available() else "cpu"
 else:
     DEVICE = "0" if torch.cuda.is_available() else "cpu"                 
+
+def enumerate_and_save_nonempty_tiles(image_dir, label_dir, output_image_dir, output_label_dir,
+                                      out_list_txt, tile_size=128, overlap=50,
+                                      rng_seed=42, split_name="train",
+                                      empty_meta_path="datasets/GeoMap/_empty_meta_train.json"):
+    """
+    PASS-1 for TRAIN:
+      - Enumerate ALL tiles, but SAVE ONLY non-empty (after boundary filter).
+      - Collect metadata for empty tiles (to save later according to R_TARGET).
+      - Write out_list_txt with saved positive tiles (only).
+    """
+    os.makedirs(output_image_dir, exist_ok=True)
+    os.makedirs(output_label_dir, exist_ok=True)
+    stride = tile_size - overlap
+    assert stride > 0, "overlap must be < tile_size"
+
+    def _cov_frac(row, x, y, ts):
+        xs = [row["x1"], row["x2"], row["x3"], row["x4"]]
+        ys = [row["y1"], row["y2"], row["y3"], row["y4"]]
+        bx1, by1, bx2, by2 = min(xs), min(ys), max(xs), max(ys)
+        tbx1, tby1, tbx2, tby2 = x, y, x+ts, y+ts
+        ax = max(0, min(bx2, tbx2) - max(bx1, tbx1))
+        ay = max(0, min(by2, tby2) - max(by1, tby1))
+        inter = ax * ay
+        area = max(1e-6, (bx2 - bx1) * (by2 - by1))
+        return inter / area
+
+    image_files = [f for f in os.listdir(image_dir) if f.lower().endswith(('.jpg','.jpeg','.png'))]
+    new_paths, empty_meta = [], []
+    P_total, E_total = 0, 0
+
+    for image_file in image_files:
+        ip = os.path.join(image_dir, image_file)
+        img = cv2.imread(ip)
+        if img is None:
+            print(f"[WARN] cannot read: {image_file}")
+            continue
+        H, W = img.shape[:2]
+
+        lbl_path = os.path.join(label_dir, os.path.splitext(image_file)[0] + ".txt")
+        labels = read_labels_or_empty(lbl_path, img_w=W, img_h=H)  # به پیکسل
+
+        pos_saved_img = 0
+        empties_enum_img = 0
+        tile_id = 0
+
+        for y in range(0, H, stride):
+            for x in range(0, W, stride):
+                if y + tile_size > H or x + tile_size > W:
+                    continue
+
+                cand = labels[
+                    ((labels["x1"] + labels["x4"]) / 2 >= x) & ((labels["x1"] + labels["x4"]) / 2 < x + tile_size) &
+                    ((labels["y1"] + labels["y4"]) / 2 >= y) & ((labels["y1"] + labels["y4"]) / 2 < y + tile_size)
+                ].copy()
+
+                if len(cand) > 0:
+                    cov = cand.apply(lambda r: _cov_frac(r, x, y, tile_size), axis=1)
+                    cand = cand[cov >= object_boundary_threshold].copy()
+
+                if len(cand) > 0:
+                    cand[["x1","x2","x3","x4"]] -= x
+                    cand[["y1","y2","y3","y4"]] -= y
+                    cand[["x1","x2","x3","x4"]] = cand[["x1","x2","x3","x4"]].clip(0, tile_size)
+                    cand[["y1","y2","y3","y4"]] = cand[["y1","y2","y3","y4"]].clip(0, tile_size)
+                    cand[["x1","x2","x3","x4"]] /= tile_size
+                    cand[["y1","y2","y3","y4"]] /= tile_size
+
+                    crop = img[y:y+tile_size, x:x+tile_size]
+                    tile_img = f"{os.path.splitext(image_file)[0]}_tile_{tile_id}.jpg"
+                    tile_lbl = f"{os.path.splitext(image_file)[0]}_tile_{tile_id}.txt"
+                    op_img = os.path.join(output_image_dir, tile_img)
+                    op_lbl = os.path.join(output_label_dir, tile_lbl)
+                    cv2.imwrite(op_img, crop)
+                    cand.to_csv(op_lbl, sep=" ", header=False, index=False)
+                    new_paths.append(op_img)
+                    P_total += 1
+                    pos_saved_img += 1
+                else:
+                    empty_meta.append({
+                        "image_file": image_file,
+                        "tile_id": int(tile_id),
+                        "x": int(x), "y": int(y),
+                        "tile_size": int(tile_size)
+                    })
+                    E_total += 1
+                    empties_enum_img += 1
+
+                tile_id += 1
+
+        print(f"[TILED] {image_file} -> tiles: {pos_saved_img + empties_enum_img} "
+              f"(positives saved: {pos_saved_img}, empties enumerated: {empties_enum_img})")
+
+    update_txt_file(out_list_txt, new_paths)
+
+    with open(empty_meta_path, "w") as f:
+        json.dump({
+            "image_dir": image_dir,
+            "output_image_dir": output_image_dir,
+            "output_label_dir": output_label_dir,
+            "empty": empty_meta
+        }, f)
+
+    print(f"[{split_name}] PASS-1 done. Positives saved: {P_total:,} | Empty enumerated: {E_total:,}")
+    return {"P_total": P_total, "E_total": E_total, "empty_meta_path": empty_meta_path}
+
+
+def count_positives_from_label_dir(label_dir: str) -> int:
+    """
+    Count how many cropped tiles are positive based on label files in label_dir.
+    A non-empty .txt (with any non-blank line) counts as positive.
+    """
+    cnt = 0
+    for fn in os.listdir(label_dir):
+        if not fn.endswith(".txt"):
+            continue
+        p = os.path.join(label_dir, fn)
+        try:
+            if os.path.getsize(p) > 0:
+                with open(p, "r") as f:
+                    if any(line.strip() for line in f):
+                        cnt += 1
+        except Exception:
+            pass
+    return cnt
+
+def save_selected_empty_tiles(empty_meta_path: str,
+                              keep_fraction: float,
+                              out_list_txt: str,
+                              rng_seed: int = 42):
+    """
+    Keep a fraction of previously enumerated empty tiles.
+    Save images + empty label files, and append their paths to out_list_txt.
+    """
+    assert 0.0 <= keep_fraction <= 1.0
+    with open(empty_meta_path, "r") as f:
+        meta = json.load(f)
+
+    image_dir = meta["image_dir"]
+    out_img_dir = meta["output_image_dir"]
+    out_lbl_dir = meta["output_label_dir"]
+    empties = meta["empty"]
+
+    if len(empties) == 0:
+        print("[INFO] No empty tiles to save.")
+        return {"E_kept": 0}
+
+    k = int(round(keep_fraction * len(empties)))
+    rng = np.random.RandomState(rng_seed)
+    idx = np.arange(len(empties))
+    rng.shuffle(idx)
+    idx = idx[:k]
+    chosen = [empties[i] for i in idx]
+
+    # cache big images
+    cache = {}
+
+    kept_paths = []
+    for rec in chosen:
+        base = rec["image_file"]
+        if base not in cache:
+            ip = os.path.join(image_dir, base)
+            cache[base] = cv2.imread(ip)
+            if cache[base] is None:
+                print(f"[WARN] cannot read: {base}")
+                continue
+        img = cache[base]
+        x, y, ts = rec["x"], rec["y"], rec["tile_size"]
+        crop = img[y:y+ts, x:x+ts]
+
+        tile_img_name = f"{os.path.splitext(base)[0]}_tile_{rec['tile_id']}.jpg"
+        tile_lbl_name = f"{os.path.splitext(base)[0]}_tile_{rec['tile_id']}.txt"
+        op_img = os.path.join(out_img_dir, tile_img_name)
+        op_lbl = os.path.join(out_lbl_dir, tile_lbl_name)
+
+        cv2.imwrite(op_img, crop)
+        open(op_lbl, "w").close()  # empty label
+
+        kept_paths.append(op_img)
+
+    # append to list
+    with open(out_list_txt, "a") as f:
+        for p in kept_paths:
+            f.write(p + "\n")
+
+    print(f"[TRAIN] Empty kept: {len(kept_paths):,} of {len(empties):,} (fraction={keep_fraction:.3f})")
+    return {"E_kept": len(kept_paths), "E_total": len(empties)}
+
+def read_labels_or_empty(label_path: str, img_w: int, img_h: int) -> pd.DataFrame:
+    """
+    Safe label loader: missing/empty/corrupt -> empty DataFrame with expected columns.
+    Denormalizes 0..1 coords to pixel coords using (img_w, img_h).
+    """
+    cols = ["class","x1","y1","x2","y2","x3","y3","x4","y4"]
+
+    # Missing or zero-byte file -> empty DF
+    if (not os.path.exists(label_path)) or (os.path.getsize(label_path) == 0):
+        return pd.DataFrame(columns=cols)
+
+    try:
+        df = pd.read_csv(
+            label_path,
+            sep=r"\s+",
+            header=None,
+            engine="python",
+            comment="#",
+            on_bad_lines="skip"
+        )
+    except Exception:
+        return pd.DataFrame(columns=cols)
+
+    if df.shape[1] < 9:
+        return pd.DataFrame(columns=cols)
+
+    df = df.iloc[:, :9].copy()
+    df.columns = cols
+    for c in cols:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df.dropna()
+    if len(df) == 0:
+        return pd.DataFrame(columns=cols)
+
+    # denormalize to pixels
+    df[["x1","x2","x3","x4"]] *= float(img_w)
+    df[["y1","y2","y3","y4"]] *= float(img_h)
+    return df
 
 def update_txt_file(txt_file, new_paths):
     """
@@ -78,91 +307,145 @@ def convert_to_grayscale(image):
     return gray_image
 
 def crop_images_and_labels(image_dir, label_dir, output_image_dir, output_label_dir,
-                           txt_file, cropped_txt_file, tile_size=512, overlap=0):
+                           txt_file, cropped_txt_file, tile_size=512, overlap=0,
+                           keep_empty_fraction=None, rng_seed=42, split_name="train",
+                           boundary_threshold=None):
     """
-    Crop images and adjust labels for YOLO format. Save results and update the .txt file with new image paths.
+      Enumerate ALL tiles in memory.
+      Apply 'boundary_threshold' to drop near-border tiny boxes.
+      Keep all non-empty + a fraction of empty tiles (global).
+      If keep_empty_fraction is None or -1, auto-compute via R_TARGET.
     """
+    if boundary_threshold is None:
+        boundary_threshold = object_boundary_threshold
+
     os.makedirs(output_image_dir, exist_ok=True)
     os.makedirs(output_label_dir, exist_ok=True)
 
-    image_files = [f for f in os.listdir(image_dir) if f.endswith(('.jpg', '.png', '.jpeg'))]
-    new_paths = []
+    image_files = [f for f in os.listdir(image_dir) if f.lower().endswith(('.jpg', '.png', '.jpeg'))]
+    all_tiles = []
+    stride = tile_size - overlap
+    assert stride > 0, "overlap must be < tile_size"
+
+    def _cov_frac(row, x, y, ts):
+        xs = [row["x1"], row["x2"], row["x3"], row["x4"]]
+        ys = [row["y1"], row["y2"], row["y3"], row["y4"]]
+        bx1, by1, bx2, by2 = min(xs), min(ys), max(xs), max(ys)
+        tbx1, tby1, tbx2, tby2 = x, y, x+ts, y+ts
+        ax = max(0, min(bx2, tbx2) - max(bx1, tbx1))
+        ay = max(0, min(by2, tby2) - max(by1, tby1))
+        inter = ax * ay
+        area = max(1e-6, (bx2 - bx1) * (by2 - by1))
+        return inter / area
 
     for image_file in image_files:
         image_path = os.path.join(image_dir, image_file)
         image = cv2.imread(image_path)
         if image is None:
-            print(f"Error reading image: {image_file}")
+            print(f"[WARN] cannot read image: {image_file}")
             continue
+        h, w = image.shape[:2]
 
-        # Convert image to grayscale
-        # image = convert_to_grayscale(image)
-        
-        h, w, _ = image.shape
-        label_file = os.path.splitext(image_file)[0] + ".txt"
-        label_path = os.path.join(label_dir, label_file)
+        label_path = os.path.join(label_dir, os.path.splitext(image_file)[0] + ".txt")
+        labels = read_labels_or_empty(label_path, img_w=w, img_h=h)  # به پیکسل
 
-        if not os.path.exists(label_path):
-            print(f"Label file not found: {label_file}")
-            continue
-
-        labels = pd.read_csv(label_path, sep=" ", header=None)
-        labels.columns = ["class", "x1", "y1", "x2", "y2", "x3", "y3", "x4", "y4"]
-        
-        labels[["x1", "x2", "x3", "x4"]] *= w
-        labels[["y1", "y2", "y3", "y4"]] *= h
-        
-        step = tile_size - overlap
         tile_id = 0
-        for y in range(0, h, step):
-            for x in range(0, w, step):
-                crop = image[y:y + tile_size, x:x + tile_size]
-                if crop.shape[0] != tile_size or crop.shape[1] != tile_size:
+        for y in range(0, h, stride):
+            for x in range(0, w, stride):
+                if y + tile_size > h or x + tile_size > w:
                     continue
 
-                tile_labels = labels[
-                    ((labels["x1"] + labels["x4"])/2 >= x) & ((labels["x1"] + labels["x4"])/2 < x + tile_size) &
-                    ((labels["y1"] + labels["y4"])/2 >= y) & ((labels["y1"] + labels["y4"])/2 < y + tile_size)
+                cand = labels[
+                    ((labels["x1"] + labels["x4"]) / 2 >= x) & ((labels["x1"] + labels["x4"]) / 2 < x + tile_size) &
+                    ((labels["y1"] + labels["y4"]) / 2 >= y) & ((labels["y1"] + labels["y4"]) / 2 < y + tile_size)
                 ].copy()
 
-                tile_labels[["x1", "x2", "x3", "x4"]] -= x
-                tile_labels[["y1", "y2", "y3", "y4"]] -= y
-                
-                tile_labels[["x1", "x2", "x3", "x4"]] = tile_labels[["x1", "x2", "x3", "x4"]].clip(0, tile_size)
-                tile_labels[["y1", "y2", "y3", "y4"]] = tile_labels[["y1", "y2", "y3", "y4"]].clip(0, tile_size)
+                if len(cand) > 0:
+                    cov = cand.apply(lambda r: _cov_frac(r, x, y, tile_size), axis=1)
+                    cand = cand[cov >= boundary_threshold].copy()
 
-                tile_labels[["x1", "x2", "x3", "x4"]] /= tile_size
-                tile_labels[["y1", "y2", "y3", "y4"]] /= tile_size
+                # shift+normalize ONLY if still non-empty
+                if len(cand) > 0:
+                    cand[["x1","x2","x3","x4"]] -= x
+                    cand[["y1","y2","y3","y4"]] -= y
+                    cand[["x1","x2","x3","x4"]] = cand[["x1","x2","x3","x4"]].clip(0, tile_size)
+                    cand[["y1","y2","y3","y4"]] = cand[["y1","y2","y3","y4"]].clip(0, tile_size)
+                    cand[["x1","x2","x3","x4"]] /= tile_size
+                    cand[["y1","y2","y3","y4"]] /= tile_size
 
-                if tile_labels.empty:
-                    continue
-
-                # Save cropped image
-                tile_image_filename = f"{os.path.splitext(image_file)[0]}_tile_{tile_id}.jpg"
-                tile_image_path = os.path.join(output_image_dir, tile_image_filename)
-                cv2.imwrite(tile_image_path, crop)
-
-                # Save adjusted labels
-                tile_label_filename = f"{os.path.splitext(image_file)[0]}_tile_{tile_id}.txt"
-                tile_label_path = os.path.join(output_label_dir, tile_label_filename)
-                tile_labels.to_csv(tile_label_path, sep=" ", header=False, index=False)
-
-
-                if not os.path.exists(tile_image_path) or tile_labels.empty:
-                    if os.path.exists(tile_image_path):
-                        os.remove(tile_image_path)
-                    if os.path.exists(tile_label_path):
-                        os.remove(tile_label_path)
-                    continue
-                
-                # Store new image path for updating the txt file
-                new_paths.append(tile_image_path)
-
+                all_tiles.append({
+                    "image_file": image_file,
+                    "tile_id": tile_id,
+                    "x": x, "y": y,
+                    "is_empty": len(cand) == 0,
+                    "tile_labels": cand
+                })
                 tile_id += 1
 
-        print(f"Processed image: {image_file}")
+        print(f"[ENUM] {split_name}:{image_file} -> tiles: {tile_id}")
+
+    total_tiles = len(all_tiles)
+    total_empty = sum(1 for t in all_tiles if t["is_empty"])
+    total_nonempty = total_tiles - total_empty
+
+    if keep_empty_fraction is None or keep_empty_fraction == -1:
+        if total_empty > 0:
+            keep_empty_fraction = min(1.0, (R_TARGET * total_nonempty) / total_empty)
+        else:
+            keep_empty_fraction = 0.0
+
+    print(f"\n[{split_name.upper()}] SUMMARY BEFORE EMPTY REMOVAL:")
+    print(f"  Total tiles:        {total_tiles:,}")
+    print(f"  Non-empty tiles:    {total_nonempty:,}")
+    print(f"  Empty tiles:        {total_empty:,}")
+    print(f"  -> keep_empty_fraction = {keep_empty_fraction:.3f} (auto={keep_empty_fraction if keep_empty_fraction is not None else 'n/a'})\n")
+
+    empty_idxs = [i for i,t in enumerate(all_tiles) if t["is_empty"]]
+    nonempty_idxs = [i for i,t in enumerate(all_tiles) if not t["is_empty"]]
+
+    rng = np.random.RandomState(rng_seed)
+    k = int(round(keep_empty_fraction * len(empty_idxs))) if len(empty_idxs) > 0 else 0
+    if 0 <= k < len(empty_idxs):
+        rng.shuffle(empty_idxs)
+        empty_idxs = empty_idxs[:k]
+
+    keep_set = set(nonempty_idxs + empty_idxs)
+
+    new_paths, _cache_img = [], {}
+    for i, t in enumerate(all_tiles):
+        if i not in keep_set:
+            continue
+
+        base = t["image_file"]
+        if base not in _cache_img:
+            ip = os.path.join(image_dir, base)
+            _cache_img[base] = cv2.imread(ip)
+            if _cache_img[base] is None:
+                print(f"[WARN] cannot read (late): {base}")
+                continue
+
+        img_big = _cache_img[base]
+        crop = img_big[t["y"]:t["y"] + tile_size, t["x"]:t["x"] + tile_size]
+
+        tile_img_name = f"{os.path.splitext(base)[0]}_tile_{t['tile_id']}.jpg"
+        tile_lbl_name = f"{os.path.splitext(base)[0]}_tile_{t['tile_id']}.txt"
+        out_img_path = os.path.join(output_image_dir, tile_img_name)
+        out_lbl_path = os.path.join(output_label_dir, tile_lbl_name)
+
+        cv2.imwrite(out_img_path, crop)
+        if t["is_empty"]:
+            open(out_lbl_path, "w").close()
+        else:
+            t["tile_labels"].to_csv(out_lbl_path, sep=" ", header=False, index=False)
+
+        new_paths.append(out_img_path)
 
     update_txt_file(cropped_txt_file, new_paths)
+
+    print(f"[{split_name}] saved tiles: {len(new_paths)} | "
+          f"non-empty kept: {len(nonempty_idxs)} | empty kept: {len(empty_idxs)} "
+          f"(keep_empty_fraction={keep_empty_fraction:.3f})")
+
 
 def elastic_transform(image, alpha=None, sigma=None):
     """
@@ -216,8 +499,8 @@ def apply_single_class_augmentation(image, labels, target_class):
     aug_results.append(('scale', scaled_img, scaled_labels))
 
     # 2. Shifting
-    shift_x = random.randint(-40, 40)
-    shift_y = random.randint(-40, 40)
+    shift_x = random.randint(-30, 30)
+    shift_y = random.randint(-30, 30)
     M = np.float32([[1, 0, shift_x], [0, 1, shift_y]])
     shifted_img = cv2.warpAffine(image, M, (width, height))
     shifted_labels = copy_labels()
@@ -709,17 +992,58 @@ if __name__ == "__main__":
     val_filtered_list   = "datasets/GeoMap/val_cropped_filt.txt"
     
     if need_cropping:
-        crop_images_and_labels(
+        # -------- TRAIN: PASS-1 (save only positives, enumerate empties) --------
+        empty_meta_path = "datasets/GeoMap/_empty_meta_train.json"
+        stats1 = enumerate_and_save_nonempty_tiles(
             image_dir=image_dir,
             label_dir=label_dir,
             output_image_dir=output_image_dir,
             output_label_dir=output_label_dir,
-            txt_file=txt_file,
-            cropped_txt_file=cropped_txt_file,
+            out_list_txt=cropped_txt_file,
             tile_size=TILE_SIZE,
             overlap=overlap,
+            rng_seed=42,
+            split_name="train",
+            empty_meta_path=empty_meta_path
         )
-
+    
+        # Augmentation only on TRAIN
+        if need_augmentation:
+            balance_classes(
+                image_dir=output_image_dir,
+                label_dir=output_label_dir,
+                txt_file=cropped_txt_file,
+                class_balance_threshold=class_balance_threshold,
+                augmentation_repeats=augmentation_repeats
+            )  # this appends new augmented positives to train list  :contentReference[oaicite:0]{index=0}
+    
+        # -------- TRAIN: decide keep_fraction automatically from R_TARGET --------
+        P_post = count_positives_from_label_dir(output_label_dir)  
+        E_total = stats1["E_total"]
+        if E_total > 0:
+            keep_fraction_auto = min(1.0, (R_TARGET * P_post) / E_total)
+        else:
+            keep_fraction_auto = 0.0
+    
+        print(f"[TRAIN] AUTO keep_fraction computed: {keep_fraction_auto:.4f} "
+              f"(R_TARGET={R_TARGET}, P_post={P_post:,}, E_total={E_total:,})")
+    
+        # -------- TRAIN: PASS-2 (save empties according to auto fraction) --------
+        save_selected_empty_tiles(
+            empty_meta_path=empty_meta_path,
+            keep_fraction=keep_fraction_auto,
+            out_list_txt=cropped_txt_file,
+            rng_seed=42
+        )
+        
+        # Final report for TRAIN after saving empties
+        P_final = count_positives_from_label_dir(output_label_dir)
+        E_final = sum(1 for fn in os.listdir(output_label_dir) if fn.endswith(".txt")) - P_final
+        print(f"[TRAIN] FINAL COUNTS after augmentation + empties:")
+        print(f"  Positives: {P_final:,}")
+        print(f"  Empties:   {E_final:,}")
+    
+        # -------- VAL --------
         crop_images_and_labels(
             image_dir=val_image_dir,
             label_dir=val_label_dir,
@@ -728,25 +1052,12 @@ if __name__ == "__main__":
             txt_file=val_txt_file,
             cropped_txt_file=val_cropped_txt_file,
             tile_size=TILE_SIZE,
-            overlap=overlap,
+            overlap=overlap,                   
+            keep_empty_fraction=None,         
+            rng_seed=42,
+            split_name="val",
+            boundary_threshold=object_boundary_threshold
         )
-
-    if need_augmentation:
-        balance_classes(
-            image_dir=output_image_dir,
-            label_dir=output_label_dir,
-            txt_file=cropped_txt_file,
-            class_balance_threshold=class_balance_threshold,
-            augmentation_repeats=augmentation_repeats            
-        )
-
-        # balance_classes(
-        #     image_dir=val_output_image_dir,
-        #     label_dir=val_output_label_dir,
-        #     txt_file=val_cropped_txt_file,
-        #     class_balance_threshold=class_balance_threshold,
-        #     augmentation_repeats=augmentation_repeats 
-        # )
 
     # ===== Build training/val inputs based on CHANNELS =====
     if CHANNELS == 3:
@@ -796,7 +1107,7 @@ if __name__ == "__main__":
             with open(val_list_4ch, "w") as f:
                 for p in va_paths: f.write(p + "\n")
         
-            DATA_YAML = "datasets/GeoMap/data4ch.yaml"  # create yaml that points to cropped4/images/{train,val}
+        DATA_YAML = "datasets/GeoMap/data4ch.yaml"  # create yaml that points to cropped4/images/{train,val}
     
     elif CHANNELS == 6:
         if APPLY_FILTERED_RGB:
@@ -816,7 +1127,7 @@ if __name__ == "__main__":
     else:
         raise ValueError("CHANNELS must be 3, 4, or 6")
     
-    model = YOLO("yolov8x-obb.pt")
+    model = YOLO("yolo11x-obb.pt")
     
     # # Size 128
     # model.train(
@@ -833,7 +1144,7 @@ if __name__ == "__main__":
     #     lrf=0.05,
     #     weight_decay=0.001,
     #     dropout=0.0,
-    #     patience=10000,
+    #     patience=50,
     #     plots=True,              
     #     overlap_mask=False,
     #     # task='obb',
@@ -860,7 +1171,7 @@ if __name__ == "__main__":
         # warmup_epochs = 5.0,
         # warmup_momentum = 0.85,
         # warmup_bias_lr = 0.08,
-        patience=10000,
+        patience=50,
         plots = True,
         overlap_mask = False,
     )

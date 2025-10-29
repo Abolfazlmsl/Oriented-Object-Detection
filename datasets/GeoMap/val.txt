@@ -1,3 +1,9 @@
-datasets/GeoMap/images/val/5313.png
-datasets/GeoMap/images/val/5609.png
-datasets/GeoMap/images/val/5812_St_Goarshausen.png
+datasets/GeoMap/images/val/5905.png
+datasets/GeoMap/images/val/5512.png
+datasets/GeoMap/images/val/6008.png
+datasets/GeoMap/images/val/6108.png
+datasets/GeoMap/images/val/6112_Waldböckelheim.png
+datasets/GeoMap/images/val/6404.png
+datasets/GeoMap/images/val/6512_Kaiserslautern.png
+datasets/GeoMap/images/val/6710.png
+datasets/GeoMap/images/val/6712.png
