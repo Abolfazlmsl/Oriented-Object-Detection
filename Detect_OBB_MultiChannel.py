@@ -16,12 +16,15 @@ import torch
 from ultralytics import YOLO
 from shapely.geometry import Polygon, Point
 import copy
+import matplotlib.pyplot as plt
+from sklearn.metrics import confusion_matrix
 
 # =========================
 # Config
 # =========================
 channels = 3        # set to 3 or 4
 APPLY_FILTER_3CH = False  
+confusion = True
 FOURCH_MODE = "dtedge"     
 MS_SIGMAS = (0, 0.6, 1.2, 2.4)
 DT_BIN_METHOD = "otsu"
@@ -35,9 +38,9 @@ NLM_T = 7
 NLM_S = 21
 
 calculate_metrics = True
-tile_sizes = [128]
-overlaps = [30]
-models = [YOLO("best128v8.pt")]
+tile_sizes = [416]
+overlaps = [100]
+models = [YOLO("best416.pt")]
 
 MAP_MIN_SCORE = 0.001
 IOU_LIST_FOR_MAP = [0.5] + [round(0.5 + 0.05*i, 2) for i in range(1, 10)]
@@ -76,15 +79,18 @@ CLASS_NAMES = {
     1: "Strike",
     2: "Spring 1",
     3: "Minepit 1",
-    4: "Hillside",
-    5: "Feuchte",
-    6: "Torf",
-    7: "Bergsturz",
+    4: "Colluvial Deposits", #Hillside
+    5: "Wetlands", #Feuchte
+    6: "Peat", #Torf
+    7: "Rockfall", #"Bergsturz"
     8: "Landslide 2",
     9: "Spring 2",
     10: "Spring 3",
     11: "Minepit 2",
 }
+
+BG_CLASS_ID = max(CLASS_NAMES.keys()) + 1
+BG_CLASS_NAME = "BG"
 
 if calculate_metrics:
     CLASS_THRESHOLDS = {cid: 0.25 for cid in CLASS_NAMES.keys()}
@@ -827,6 +833,90 @@ def _evaluate_dataset(all_images, conf_thr, iou_thr):
         tot_tp += tp; tot_fp += fp; tot_fn += fn
     return _prec_rec_f1(tot_tp, tot_fp, tot_fn)
 
+def plot_confusion_matrices(all_images, conf_thr=0.25, iou_thr=0.5, normalize=True):
+    """
+    Draws large, high-resolution confusion matrices (raw + normalized)
+    that remain readable even for many classes.
+    """
+    y_true, y_pred = [], []
+
+    for img_path in all_images:
+        dets = [d for d in all_dets_per_image.get(img_path, [])
+                if (d[9] >= conf_thr and int(d[8]) not in EXCLUDED_CLASSES)]
+        gts = [g for g in _load_gt_as_pixels(img_path) if g["cls"] not in EXCLUDED_CLASSES]
+
+        gt_used = [False] * len(gts)
+        dets_sorted = sorted(dets, key=lambda x: x[9], reverse=True)
+
+        # --- IoU-based greedy matching ---
+        for d in dets_sorted:
+            d_box = d[:8]
+            d_cls = int(d[8])
+
+            best_iou, best_j = 0.0, -1
+            for j, g in enumerate(gts):
+                if gt_used[j]:
+                    continue
+                g_box = [c for pt in g["pts"] for c in pt]
+                iou = compute_polygon_iou(d_box, g_box)
+                if iou > best_iou:
+                    best_iou, best_j = iou, j
+
+            if best_iou >= iou_thr and best_j >= 0:
+                y_true.append(int(gts[best_j]["cls"]))
+                y_pred.append(d_cls)
+                gt_used[best_j] = True
+            else:
+                y_true.append(BG_CLASS_ID)
+                y_pred.append(d_cls)
+
+        for j, g in enumerate(gts):
+            if not gt_used[j]:
+                y_true.append(int(g["cls"]))
+                y_pred.append(BG_CLASS_ID)
+
+    labels = sorted(CLASS_NAMES.keys()) + [BG_CLASS_ID]
+    display_labels = [CLASS_NAMES[i] for i in sorted(CLASS_NAMES.keys())] + [BG_CLASS_NAME]
+
+    # --- compute confusion matrix ---
+    cm = confusion_matrix(y_true, y_pred, labels=labels)
+
+    def draw_matrix(matrix, title, filename, fmt=".2f", cmap="Blues"):
+        """Helper to draw large and readable matrix"""
+        plt.figure(figsize=(len(display_labels) * 0.8, len(display_labels) * 0.8))
+        plt.imshow(matrix, interpolation="nearest", cmap=cmap)
+        plt.title(title, fontsize=16)
+        plt.colorbar(fraction=0.046, pad=0.04)
+        tick_marks = np.arange(len(display_labels))
+        plt.xticks(tick_marks, display_labels, rotation=60, ha='right', fontsize=10)
+        plt.yticks(tick_marks, display_labels, fontsize=10)
+
+        # Write values only if matrix is small enough (< 20 classes)
+        if len(display_labels) <= 15:
+            thresh = matrix.max() / 2.
+            for i in range(matrix.shape[0]):
+                for j in range(matrix.shape[1]):
+                    plt.text(j, i, format(matrix[i, j], fmt),
+                             ha="center", va="center",
+                             color="white" if matrix[i, j] > thresh else "black",
+                             fontsize=8)
+
+        plt.ylabel("True label", fontsize=12)
+        plt.xlabel("Predicted label", fontsize=12)
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, filename), dpi=300)
+        plt.close()
+
+    # --- Raw ---
+    draw_matrix(cm, "Confusion Matrix (Raw)", "confusion_matrix_raw.png", fmt="d")
+
+    # --- Normalized ---
+    if normalize:
+        with np.errstate(invalid="ignore", divide="ignore"):
+            cm_norm = cm.astype(float) / cm.sum(axis=1, keepdims=True)
+            cm_norm = np.nan_to_num(cm_norm)
+        draw_matrix(cm_norm, "Confusion Matrix (Normalized)", "confusion_matrix_normalized.png", fmt=".2f")
+
 def _classwise_report(dets_source, all_images, conf_thr, iou_thr):
     rows = []
     # collect class ids from source
@@ -891,6 +981,8 @@ def run_fusion_eval(input_dir, iou_thr=iou_thr):
         print(f"mAP@0.3 = {maps_soft['per_iou'][0.30]:.4f}")
         soft_avg = float(np.mean([maps_soft['per_iou'][i] for i in [0.30,0.40,0.50,0.60,0.70]]))
         print(f"mAP@[0.3:0.7] = {soft_avg:.4f}")
+        if confusion:
+            plot_confusion_matrices(all_images, conf_thr=thr, iou_thr=iou_thr)
         return
 
     # ===== MULTI-SCALE =====
@@ -917,6 +1009,8 @@ def run_fusion_eval(input_dir, iou_thr=iou_thr):
     print(f"mAP@0.3 = {maps_soft['per_iou'][0.30]:.4f}")
     soft_avg = float(np.mean([maps_soft['per_iou'][i] for i in [0.30,0.40,0.50,0.60,0.70]]))
     print(f"mAP@[0.3:0.7] = {soft_avg:.4f}")
+    if confusion:
+        plot_confusion_matrices(all_images, conf_thr=thr, iou_thr=iou_thr)
     
 # =========================
 # Main
