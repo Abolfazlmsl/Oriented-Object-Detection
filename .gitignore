@@ -1,5 +1,4 @@
 runs
-Output/*
 best128.pt
 best416.pt
 yolo11x-obb.pt
